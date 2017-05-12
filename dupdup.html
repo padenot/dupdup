@@ -1,0 +1,64 @@
+<!doctype html>
+<html>
+<head>
+<meta charset=utf-8>
+<style>
+body {
+  font-family: courier;
+}
+.match {
+  border: 1px solid rgba(0, 0, 0, 0.1);
+}
+</style>
+</head>
+<body>
+<h1>dupdup</h1>
+<input type=file id=picker></input>
+Reject filter regexp:
+<input type=text id=filter value="lrf?m?prev"></input>
+<ul>
+</ul>
+</body>
+<script>
+window.onload = function() {
+  filter_input = document.querySelector("#filter");
+  ignore_regexp = filter_input.value;
+  ul = document.querySelector("ul");
+  inp = document.querySelector("#picker");
+  dupes = null;
+
+  filter_input.onchange = function() {
+    document.querySelector("ul").innerHTML = "";
+    analyse(dupes)
+  }
+  inp.onchange = function(e) {
+    var fr = new FileReader();
+    fr.onload = function(e) {
+      dupes = JSON.parse(e.target.result);
+      analyse(dupes);
+    }
+    fr.readAsText(e.target.files[0]);
+  }
+}
+
+function analyse(dupes) {
+  var sorted = [];
+  var reg = new RegExp(filter_input.value);
+  for (var i in dupes) {
+    if (!dupes[i][0].match(reg)) {
+      var str = "";
+      for (var dupe in dupes[i]) {
+        str += '<span class="match">' + dupes[i][dupe] + "</span> ";
+      }
+      sorted.push(str)
+    }
+  }
+  sorted.sort();
+  for (var i in sorted) {
+    var li = document.createElement("li");
+    li.innerHTML = sorted[i];
+    ul.appendChild(li);
+  }
+}
+</script>
+</html>
