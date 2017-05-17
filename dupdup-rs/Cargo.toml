@@ -1,0 +1,59 @@
+[package]
+name = "dupdup"
+version = "0.1.0"
+authors = ["Paul Adenot <paul@paul.cx>"]
+
+[dependencies]
+walkdir = "1"
+md5 = "0.3.4"
+serde_json = "1.0"
+clap = "2.24"
+time = "0.1"
+
+[package]
+description = "Find duplicate file"
+
+# These URLs point to more information about the repository. These are
+# intended to be webviews of the relevant data, not necessarily compatible
+# with VCS tools and the like.
+documentation = ""
+homepage = "..."
+repository = "..."
+
+# This points to a file in the repository (relative to this `Cargo.toml`). The
+# contents of this file are stored and indexed in the registry.
+readme = "..."
+
+# This is a list of up to five keywords that describe this crate. Keywords
+# are searchable on crates.io, and you may choose any words that would
+# help someone find this crate.
+keywords = ["...", "..."]
+
+# This is a list of up to five categories where this crate would fit.
+# Categories are a fixed list available at crates.io/category_slugs, and
+# they must match exactly.
+categories = ["...", "..."]
+
+# This is a string description of the license for this package. Currently
+# crates.io will validate the license provided against a whitelist of known
+# license identifiers from http://spdx.org/licenses/. Multiple licenses can be
+# separated with a `/`.
+license = "..."
+
+# If a project is using a nonstandard license, then this key may be specified in
+# lieu of the above key and must point to a file relative to this manifest
+# (similar to the readme key).
+license-file = "..."
+
+# Optional specification of badges to be displayed on crates.io. The badges
+# currently available are Travis CI, Appveyor, and GitLab latest build status,
+# specified using the following parameters:
+[badges]
+# Travis CI: `repository` is required. `branch` is optional; default is `master`
+travis-ci = { repository = "...", branch = "master" }
+# Appveyor: `repository` is required. `branch` is optional; default is `master`
+# `service` is optional; valid values are `github` (default), `bitbucket`, and
+# `gitlab`.
+appveyor = { repository = "...", branch = "master", service = "github" }
+# GitLab: `repository` is required. `branch` is optional; default is `master`
+gitlab = { repository = "...", branch = "master" }
