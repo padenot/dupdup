@@ -27,6 +27,9 @@ total_files = 0
 wasted_space = 0
 dupes = 0
 
+start = time()
+last_print_time = time()
+
 def convert_size(size_bytes):
    if size_bytes == 0:
        return "0B"
@@ -36,7 +39,43 @@ def convert_size(size_bytes):
    s = round(size_bytes / p, 2)
    return "{}{}".format(s, size_name[i])
 
-start = time()
+def print_stats(f, idx, total_files, dupes, wasted):
+    global last_print_time
+    t = time()
+    if t - last_print_time > args.interval:
+        wasted = convert_size(wasted_space)
+        sys.stdout.write("\r\033[0K");
+        sys.stdout.write("{} ({}/{}) (dups: {}, {})".format(f, idx, total_files, dupes, wasted))
+        sys.stdout.flush()
+        last_print_time = t
+
+# hash a portion or the totality of the file, and insert it into the dict
+# `dups`. Returns the size of the file if it's a suspected duplicate, 0
+# otherwise.
+def hash_and_insert(f, dups, complete):
+    hasher = hashlib.md5()
+
+    try:
+        ff = open(f)
+    except:
+        print "skipping {}".format(f), sys.exc_info()[0]
+        return
+
+    buf = ff.read(BLOCKSIZE)
+    hasher.update(buf)
+    while len(buf) > 0 and complete:
+        buf = ff.read(BLOCKSIZE)
+        hasher.update(buf)
+
+    digest = hasher.hexdigest()
+    dups[digest].append(f)
+    if len(dups[digest]) > 1:
+        size = os.fstat(ff.fileno()).st_size
+    else:
+        size = 0
+
+    return size
+
 
 print "analysing files under {}".format(args.path)
 
@@ -47,38 +86,35 @@ for dirname, dirnames, filenames in os.walk(args.path):
 total_files = len(filelist)
 print "{} files to analyse...".format(total_files)
 
-last_print_time = time()
+candidates = defaultdict(list)
 
 for idx,f in enumerate(filelist):
-    t = time()
-    if t - last_print_time > args.interval:
-        wasted = convert_size(wasted_space)
-        sys.stdout.write("\r\033[0K");
-        sys.stdout.write("{} ({}/{}) (dups: {}, {})".format(f, idx, total_files, dupes, wasted))
-        sys.stdout.flush()
-        last_print_time = t
+    wasted = hash_and_insert(f, candidates, False)
 
-    hasher = hashlib.md5()
-
-    try:
-        ff = open(f)
-    except:
-        print "skipping {}".format(f), sys.exc_info()[0]
-        continue
-
-    buf = ff.read(BLOCKSIZE)
-    while len(buf) > 0:
-        hasher.update(buf)
-        buf = ff.read(BLOCKSIZE)
-
-    digest = hasher.hexdigest()
-
-    hashed[digest].append(f)
-    if len(hashed[digest]) > 1:
+    print_stats(f, idx, total_files, dupes, wasted)
+    if wasted > 0:
         dupes = dupes + 1
-        wasted_space += os.fstat(ff.fileno()).st_size
+        wasted_space += wasted
 
 sys.stdout.write("\r")
+print "first pass done, {} suspected dupes, {} wasted".format(dupes, convert_size(wasted_space))
+
+wasted_space = dupes = total_idx = 0
+total_files = dupes
+
+hashed = defaultdict(list)
+
+for digest,path in candidates.iteritems():
+    if len(path) > 1:
+        total_idx = total_idx + 1
+        for p in path:
+            wasted = hash_and_insert(p, hashed, True)
+
+            if wasted > 0:
+                dupes = dupes + 1
+                wasted_space += wasted
+
+            print_stats(p, total_idx, total_files, dupes, wasted)
 
 duplicates = defaultdict(list)
 
