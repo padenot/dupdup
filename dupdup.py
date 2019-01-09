@@ -11,7 +11,7 @@ import argparse
 
 parser = argparse.ArgumentParser(description='Find duplicate files.')
 
-parser.add_argument("path", type=str, nargs='?', default=os.getcwd(),
+parser.add_argument("path", type=str, nargs='*', default=os.getcwd(),
                     help="path to search for duplicates")
 parser.add_argument("-o", "--output", type=str, help="output file")
 parser.add_argument("-i", "--interval", type=int, default=1,
@@ -79,9 +79,11 @@ def hash_and_insert(f, dups, complete):
 
 print "analysing files under {}".format(args.path)
 
-for dirname, dirnames, filenames in os.walk(args.path):
-    for filename in filenames:
-        filelist.append(os.path.join(dirname, filename))
+for path in args.path:
+    for dirname, dirnames, filenames in os.walk(path):
+        for filename in filenames:
+            full = os.path.join(dirname, filename)
+            filelist.append(full)
 
 total_files = len(filelist)
 print "{} files to analyse...".format(total_files)
