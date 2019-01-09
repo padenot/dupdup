@@ -8,6 +8,7 @@ from time import time
 import math
 import json
 import argparse
+import stat
 
 parser = argparse.ArgumentParser(description='Find duplicate files.')
 
@@ -56,7 +57,11 @@ def hash_and_insert(f, dups, complete):
     hasher = hashlib.md5()
 
     try:
-        ff = open(f)
+        # ignore links and pipes and whatnot
+        if stat.S_ISREG(os.stat(f).st_mode):
+            ff = open(f)
+        else:
+            return
     except:
         print "skipping {}".format(f), sys.exc_info()[0]
         return
