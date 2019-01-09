@@ -50,6 +50,15 @@ def print_stats(f, idx, total_files, dupes, wasted):
         sys.stdout.flush()
         last_print_time = t
 
+def print_walk(path):
+    global last_print_time
+    t = time()
+    if t - last_print_time > args.interval:
+        sys.stdout.write("\r\033[0K");
+        sys.stdout.write("{}".format(path))
+        sys.stdout.flush()
+        last_print_time = t
+
 # hash a portion or the totality of the file, and insert it into the dict
 # `dups`. Returns the size of the file if it's a suspected duplicate, 0
 # otherwise.
@@ -84,11 +93,16 @@ def hash_and_insert(f, dups, complete):
 
 print "analysing files under {}".format(args.path)
 
+i = 0
 for path in args.path:
     for dirname, dirnames, filenames in os.walk(path):
         for filename in filenames:
             full = os.path.join(dirname, filename)
             filelist.append(full)
+            i+=1
+            if i > 1000:
+                i = 0
+                print_walk(full)
 
 total_files = len(filelist)
 print "{} files to analyse...".format(total_files)
