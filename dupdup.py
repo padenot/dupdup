@@ -12,7 +12,7 @@ import stat
 
 parser = argparse.ArgumentParser(description='Find duplicate files.')
 
-parser.add_argument("path", type=str, nargs='*', default=os.getcwd(),
+parser.add_argument("path", type=str, nargs='*', default=[os.getcwd()],
                     help="path to search for duplicates")
 parser.add_argument("-o", "--output", type=str, help="output file")
 parser.add_argument("-i", "--interval", type=int, default=1,
