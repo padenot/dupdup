@@ -9,6 +9,9 @@ body {
 .match {
   border: 1px solid rgba(0, 0, 0, 0.1);
 }
+.picked {
+  background-color: rgba(128, 255, 128, 0.5);
+}
 </style>
 </head>
 <body>
@@ -16,16 +19,35 @@ body {
 <input type=file id=picker></input>
 Reject filter regexp:
 <input type=text id=filter value="lrf?m?prev"></input>
+<button id=export>export script</button>
 <ul>
 </ul>
 </body>
 <script>
+
+function download(filename, text) {
+  var el = document.createElement('a');
+  el.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(text));
+  el.setAttribute('download', filename);
+  el.style.display = 'none';
+  document.body.appendChild(el);
+
+  el.click();
+
+  document.body.removeChild(el);
+}
+
 window.onload = function() {
+  last_picked_index = 0;
+  last_clicked_match = null;
   filter_input = document.querySelector("#filter");
   ignore_regexp = filter_input.value;
   ul = document.querySelector("ul");
   inp = document.querySelector("#picker");
   dupes = null;
+  window.onkeypress = function(e) {
+    console.log(e.keyCode);
+  }
 
   filter_input.onchange = function() {
     document.querySelector("ul").innerHTML = "";
@@ -38,6 +60,79 @@ window.onload = function() {
       analyse(dupes);
     }
     fr.readAsText(e.target.files[0]);
+  }
+  function pickOne(el) {
+    var p = el.parentNode;
+    for (var i = 0; i < p.children.length; i++) {
+      if (el == p.children[i]) {
+        el.classList.toggle("picked");
+      } else {
+        p.children[i].classList.remove("picked");
+      }
+    }
+  }
+
+  function atLeastOne(el) {
+    var p = el.parentNode;
+    for (var i = 0; i < p.children.length; i++) {
+      if (p.children[i].classList.contains("picked")) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  document.body.onclick = function(e) {
+    if (e.target.classList.contains("match")) {
+      if (e.shiftKey) {
+        if (last_clicked_match) {
+          let startNode = e.target.parentNode;
+          let startNodeIndex = -1;
+          let endNodeIndex = -1;
+          var list_items = document.querySelectorAll("li");
+          for (var i = 0 ; i < list_items.length; i++) {
+            if (startNode == list_items[i]) {
+              startNodeIndex = i;
+            } else if (last_clicked_match == list_items[i]) {
+              endNodeIndex = i;
+            }
+          }
+          if (startNodeIndex == -1 || endNodeIndex == -1) {
+            throw "!?";
+          }
+          if (startNodeIndex > endNodeIndex) {
+            var tmp = endNodeIndex;
+            endNodeIndex = startNodeIndex;
+            startNodeIndex = tmp;
+          }
+
+          for (var i = startNodeIndex + 1; i <= endNodeIndex; i++) {
+            pickOne(list_items[i].children[last_picked_index]);
+          }
+        }
+      } else {
+        pickOne(e.target);
+        var node = e.target;
+        var idx = 0;
+        for (var i=0; (node=node.previousElementSibling); i++) {
+          idx++;
+        }
+        last_clicked_match = e.target.parentNode;
+        last_picked_index = i;
+      }
+      e.preventDefault();
+    }
+  }
+  document.querySelector("#export").onclick = function() {
+    // check if some are not picked.
+    var to_rm = document.querySelectorAll(":not(.picked).match");
+    var script = "";
+    for (var i = 0; i < to_rm.length; i++) {
+      if (atLeastOne(to_rm[i])) {
+        script += "rm " + to_rm[i].textContent + "\n";
+      }
+    }
+    download("remove_script.sh", script);
   }
 }
 
