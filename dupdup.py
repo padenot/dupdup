@@ -120,8 +120,8 @@ for idx,f in enumerate(filelist):
 sys.stdout.write("\r")
 print "first pass done, {} suspected dupes, {} wasted".format(dupes, convert_size(wasted_space))
 
-wasted_space = dupes = total_idx = 0
 total_files = dupes
+wasted_space = dupes = total_idx = 0
 
 hashed = defaultdict(list)
 
