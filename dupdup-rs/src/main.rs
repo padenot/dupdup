@@ -64,7 +64,7 @@ fn process_file(
             dup = true;
             e.push(path.to_string());
         })
-        .or_insert(vec![path.to_string()]);
+        .or_insert_with(|| { vec![path.to_string()] });
     if dup {
         Ok(total_bytes_read)
     } else {
