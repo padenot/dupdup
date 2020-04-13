@@ -6,11 +6,13 @@
 body {
   font-family: courier;
 }
-.match {
-  border: 1px solid rgba(0, 0, 0, 0.1);
-}
 .picked {
   background-color: rgba(128, 255, 128, 0.5);
+}
+li {
+  border-left: 4px solid black;
+  margin-bottom: 0.6em;
+  list-style: none;
 }
 </style>
 </head>
@@ -143,7 +145,7 @@ function analyse(dupes) {
     if (!dupes[i][0].match(reg)) {
       var str = "";
       for (var dupe in dupes[i]) {
-        str += '<span class="match">' + dupes[i][dupe] + "</span> ";
+        str += '<div class="match">' + dupes[i][dupe] + "</div> ";
       }
       sorted.push(str)
     }
