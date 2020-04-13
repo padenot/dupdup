@@ -15,6 +15,7 @@ use std::io;
 use std::io::prelude::*;
 use std::io::Read;
 use walkdir::WalkDir;
+use std::fs;
 
 enum HashComputationType {
     Partial(usize),
@@ -118,8 +119,6 @@ fn main() -> std::io::Result<()> {
         None => format!("error-{}.log", Utc::now().format("%F-%T")),
     };
 
-    println!("{}", error_log_file);
-
     let mut error_file = File::create(error_log_file.clone())?;
 
     let mut partial_results: HashMap<String, Vec<String>> = HashMap::new();
@@ -147,7 +146,8 @@ fn main() -> std::io::Result<()> {
 
     let mut small_buf = buf.split_at_mut(4 * 1024).0;
     let mut current = 0;
-    let mut wasted = 0;
+    let mut wasted: usize = 0;
+    let mut dups = 0;
     for entry in wd {
         if entry.is_err() {
             write!(error_file, "Could not enumerate an entry")?;
@@ -178,7 +178,11 @@ fn main() -> std::io::Result<()> {
                 got_error = true;
             }
             Ok(w) => {
-                wasted += w;
+                if w != 0 {
+                    let size = fs::metadata(path_str)?.len() as usize;
+                    wasted+= size;
+                    dups += 1;
+                }
             }
         }
         if (time::precise_time_s() - last_time) as f32 > interval {
@@ -199,7 +203,7 @@ fn main() -> std::io::Result<()> {
     }
 
     print!("\r");
-    println!("First pass finished, potentially wasted {}.", bytesize::to_string(wasted as u64, false));
+    println!("First pass finished, potentially wasted {} in {} duplicated files.", bytesize::to_string(wasted as u64, false), dups);
 
     let mut results: HashMap<String, Vec<String>> = HashMap::new();
     current = 0;
@@ -241,12 +245,13 @@ fn main() -> std::io::Result<()> {
 
     print!("\r");
 
-    println!("Second pass finished, potentially wasted {}.", bytesize::to_string(wasted as u64, false));
 
     let filtered: HashMap<String, Vec<String>> = results
         .into_iter()
         .filter(|&(_, ref v)| v.len() != 1)
         .collect();
+
+    println!("Second pass finished, wasted {} in {} duplicated files.", bytesize::to_string(wasted as u64, false), filtered.len());
 
     let json_text = serde_json::to_string(&filtered).unwrap();
 
