@@ -188,9 +188,10 @@ fn main() -> std::io::Result<()> {
         if (time::precise_time_s() - last_time) as f32 > interval {
             print!("\r");
             print!(
-                "[{}/{}] {path:<width$}",
+                "[{}/{}][{}] {path:<width$}",
                 current,
                 count,
+                bytesize::to_string(wasted as u64, false),
                 path = path.display(),
                 width = 100
             );
@@ -228,9 +229,10 @@ fn main() -> std::io::Result<()> {
             if (time::precise_time_s() - last_time) as f32 > interval {
                 print!("\r");
                 print!(
-                    "[{}/{}] {path:<width$}",
+                    "[{}/{}][{}] {path:<width$}",
                     current,
                     count,
+                    bytesize::to_string(wasted as u64, false),
                     path = candidate,
                     width = 100
                 );
