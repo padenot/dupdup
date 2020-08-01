@@ -3,19 +3,19 @@ extern crate serde_json;
 extern crate walkdir;
 #[macro_use]
 extern crate clap;
+extern crate bytesize;
 extern crate chrono;
 extern crate time;
-extern crate bytesize;
 
 use chrono::Utc;
 use clap::{App, Arg};
 use std::collections::HashMap;
+use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::prelude::*;
 use std::io::Read;
 use walkdir::WalkDir;
-use std::fs;
 
 enum HashComputationType {
     Partial(usize),
@@ -65,7 +65,7 @@ fn process_file(
             dup = true;
             e.push(path.to_string());
         })
-        .or_insert_with(|| { vec![path.to_string()] });
+        .or_insert_with(|| vec![path.to_string()]);
     if dup {
         Ok(total_bytes_read)
     } else {
@@ -129,7 +129,7 @@ fn main() -> std::io::Result<()> {
     let mut count = 0;
     for entry in wd {
         if entry.is_err() {
-            write!(error_file, "{} enumeration error\n", entry.unwrap_err())?;
+            writeln!(error_file, "{} enumeration error", entry.unwrap_err())?;
             got_error = true;
             continue;
         }
@@ -150,7 +150,7 @@ fn main() -> std::io::Result<()> {
     let mut dups = 0;
     for entry in wd {
         if entry.is_err() {
-            write!(error_file, "Could not enumerate an entry")?;
+            writeln!(error_file, "Could not enumerate an entry")?;
             got_error = true;
             continue;
         }
@@ -162,7 +162,7 @@ fn main() -> std::io::Result<()> {
         let path_str = match path.to_str() {
             Some(p) => p,
             None => {
-                write!(error_file, "could not convert {} to string", path.display())?;
+                writeln!(error_file, "could not convert {} to string", path.display())?;
                 got_error = true;
                 continue;
             }
@@ -174,13 +174,13 @@ fn main() -> std::io::Result<()> {
             HashComputationType::Partial(4 * 1024),
         ) {
             Err(e) => {
-                write!(error_file, "{}", e)?;
+                writeln!(error_file, "{}", e)?;
                 got_error = true;
             }
             Ok(w) => {
                 if w != 0 {
                     let size = fs::metadata(path_str)?.len() as usize;
-                    wasted+= size;
+                    wasted += size;
                     dups += 1;
                 }
             }
@@ -204,13 +204,21 @@ fn main() -> std::io::Result<()> {
     }
 
     print!("\r");
-    println!("First pass finished, potentially wasted {} in {} duplicated files.", bytesize::to_string(wasted as u64, false), dups);
+    println!(
+        "First pass finished, potentially wasted {} in {} duplicated files.",
+        bytesize::to_string(wasted as u64, false),
+        dups
+    );
+
+    let initial_dups: HashMap<String, Vec<String>> = partial_results
+        .into_iter()
+        .filter(|(_, v)| v.len() > 1)
+        .collect();
 
     let mut results: HashMap<String, Vec<String>> = HashMap::new();
     current = 0;
     wasted = 0;
-    let count = partial_results.len();
-    for (_, v) in partial_results.iter() {
+    for (_, v) in initial_dups.iter() {
         for candidate in v {
             match process_file(
                 &candidate,
@@ -219,7 +227,7 @@ fn main() -> std::io::Result<()> {
                 HashComputationType::Full,
             ) {
                 Err(e) => {
-                    write!(error_file, "{}", e)?;
+                    writeln!(error_file, "{}", e)?;
                     got_error = true;
                 }
                 Ok(w) => {
@@ -231,7 +239,7 @@ fn main() -> std::io::Result<()> {
                 print!(
                     "[{}/{}][{}] {path:<width$}",
                     current,
-                    count,
+                    dups,
                     bytesize::to_string(wasted as u64, false),
                     path = candidate,
                     width = 100
@@ -247,20 +255,23 @@ fn main() -> std::io::Result<()> {
 
     print!("\r");
 
-
     let filtered: HashMap<String, Vec<String>> = results
         .into_iter()
         .filter(|&(_, ref v)| v.len() != 1)
         .collect();
 
-    println!("Second pass finished, wasted {} in {} duplicated files.", bytesize::to_string(wasted as u64, false), filtered.len());
+    println!(
+        "Second pass finished, wasted {} in {} duplicated files.",
+        bytesize::to_string(wasted as u64, false),
+        filtered.len()
+    );
 
     let json_text = serde_json::to_string(&filtered).unwrap();
 
     let mut file = File::create(output_file).unwrap();
     let rv = file.write_all(json_text.as_bytes());
     if rv.is_err() {
-        write!(error_file, "could write json report to {}\n", output_file)?;
+        writeln!(error_file, "could write json report to {}", output_file)?;
         got_error = true;
     } else {
         println!("JSON report written in {}", output_file);
