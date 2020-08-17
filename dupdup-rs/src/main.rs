@@ -278,7 +278,7 @@ fn main() -> std::io::Result<()> {
     let mut file = File::create(output_file).unwrap();
     let rv = file.write_all(json_text.as_bytes());
     if rv.is_err() {
-        writeln!(error_file, "could write json report to {}", output_file)?;
+        writeln!(error_file, "could not write json report to {}", output_file)?;
         got_error = true;
     } else {
         println!("JSON report written in {}", output_file);
@@ -289,7 +289,7 @@ fn main() -> std::io::Result<()> {
             error_log_file
         );
     } else {
-        println!("Duplication search completed with errors.");
+        println!("Duplication search completed without errors.");
         std::fs::remove_file(error_log_file)?;
     }
     Ok(())
