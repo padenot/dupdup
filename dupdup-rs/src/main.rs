@@ -73,9 +73,11 @@ fn process_file(
     }
 }
 
+const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+
 fn main() -> std::io::Result<()> {
     let matches = App::new("dupdup-rs")
-        .version("0.1")
+        .version(VERSION)
         .author("Paul Adenot <paul@paul.cx>")
         .about("Find duplicate files")
         .arg(Arg::with_name("path").help("path to analyse").index(1))
