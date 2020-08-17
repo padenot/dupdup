@@ -149,7 +149,6 @@ fn main() -> std::io::Result<()> {
     let mut small_buf = buf.split_at_mut(4 * 1024).0;
     let mut current = 0;
     let mut wasted: usize = 0;
-    let mut dups = 0;
     for entry in wd {
         if entry.is_err() {
             writeln!(error_file, "Could not enumerate an entry")?;
@@ -183,7 +182,6 @@ fn main() -> std::io::Result<()> {
                 if w != 0 {
                     let size = fs::metadata(path_str)?.len() as usize;
                     wasted += size;
-                    dups += 1;
                 }
             }
         }
@@ -205,17 +203,24 @@ fn main() -> std::io::Result<()> {
         current += 1;
     }
 
+    let mut count = 0;
+    let initial_dups: HashMap<String, Vec<String>> = partial_results
+        .into_iter()
+        .filter(|(_, v)| {
+            if v.len() > 1 {
+                count += v.len();
+                return true;
+            }
+            false
+        })
+        .collect();
+
     print!("\r");
     println!(
         "First pass finished, potentially wasted {} in {} duplicated files.",
         bytesize::to_string(wasted as u64, false),
-        dups
+        count
     );
-
-    let initial_dups: HashMap<String, Vec<String>> = partial_results
-        .into_iter()
-        .filter(|(_, v)| v.len() > 1)
-        .collect();
 
     let mut results: HashMap<String, Vec<String>> = HashMap::new();
     current = 0;
@@ -241,7 +246,7 @@ fn main() -> std::io::Result<()> {
                 print!(
                     "[{}/{}][{}] {path:<width$}",
                     current,
-                    dups,
+                    count,
                     bytesize::to_string(wasted as u64, false),
                     path = candidate,
                     width = 100
