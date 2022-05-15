@@ -131,7 +131,7 @@ window.onload = function() {
     var script = "";
     for (var i = 0; i < to_rm.length; i++) {
       if (atLeastOne(to_rm[i])) {
-        script += "rm " + to_rm[i].textContent + "\n";
+        script += "rm \"" + to_rm[i].textContent + "\"\n";
       }
     }
     download("remove_script.sh", script);
