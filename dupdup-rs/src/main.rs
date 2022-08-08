@@ -14,6 +14,8 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::prelude::*;
+use std::io::Error;
+use std::io::ErrorKind;
 use std::io::Read;
 use walkdir::WalkDir;
 
@@ -108,6 +110,18 @@ fn main() -> std::io::Result<()> {
     let output_file = matches.value_of("output").unwrap_or("results.json");
     let interval = value_t!(matches.value_of("interval"), f32).unwrap_or(1.0);
     let mut got_error = false;
+
+    let metadata = fs::metadata(output_file);
+
+    match metadata {
+        Ok(_) => {
+            println!("File {} already exists.", output_file);
+            return Err(Error::new(ErrorKind::Other, "Output file already exists"));
+        }
+        Err(e) => {
+            println!("{:?}", e);
+        }
+    }
 
     println!(
         "Looking for duplicates in {}, will output report in {}",
