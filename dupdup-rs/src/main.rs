@@ -82,7 +82,7 @@ fn main() -> std::io::Result<()> {
         .version(VERSION)
         .author("Paul Adenot <paul@paul.cx>")
         .about("Find duplicate files")
-        .arg(Arg::with_name("path").help("path to analyse").index(1))
+        .arg(Arg::with_name("path").help("path to analyse").min_values(1))
         .arg(
             Arg::with_name("output")
                 .short("o")
@@ -106,10 +106,11 @@ fn main() -> std::io::Result<()> {
         )
         .get_matches();
 
-    let search_path = matches.value_of("path").unwrap_or(".");
+    let search_paths = matches.values_of("path").unwrap();
     let output_file = matches.value_of("output").unwrap_or("results.json");
     let interval = value_t!(matches.value_of("interval"), f32).unwrap_or(1.0);
     let mut got_error = false;
+    let paths : Vec<&str> = search_paths.collect();
 
     let metadata = fs::metadata(output_file);
 
@@ -123,12 +124,11 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    println!(
-        "Looking for duplicates in {}, will output report in {}",
-        search_path, output_file
-    );
-
-    let wd = WalkDir::new(search_path);
+    println!("Looking for duplicates in:");
+    for path in paths.iter() {
+        println!("\t{}", path);
+    }
+    println!("will output report in {}", output_file);
 
     let error_log_file = match matches.value_of("error") {
         Some(v) => v.to_string(),
@@ -143,78 +143,83 @@ fn main() -> std::io::Result<()> {
 
     let mut last_time = time::precise_time_s();
     let mut count = 0;
-    for entry in wd {
-        if entry.is_err() {
-            writeln!(error_file, "{} enumeration error", entry.unwrap_err())?;
-            got_error = true;
-            continue;
+
+    for dir in paths.iter() {
+        let wd = WalkDir::new(dir);
+        for entry in wd {
+            if entry.is_err() {
+                writeln!(error_file, "{} enumeration error", entry.unwrap_err())?;
+                got_error = true;
+                continue;
+            }
+            let f = entry.unwrap();
+            if f.file_type().is_dir() {
+                continue;
+            }
+            count += 1;
         }
-        let f = entry.unwrap();
-        if f.file_type().is_dir() {
-            continue;
-        }
-        count += 1;
     }
 
     println!("{} total files to consider...", count);
 
-    let wd = WalkDir::new(search_path);
-
-    let mut small_buf = buf.split_at_mut(4 * 1024).0;
     let mut current = 0;
     let mut wasted: usize = 0;
-    for entry in wd {
-        if entry.is_err() {
-            writeln!(error_file, "Could not enumerate an entry")?;
-            got_error = true;
-            continue;
-        }
-        let f = entry.unwrap();
-        if f.file_type().is_dir() {
-            continue;
-        }
-        let path = f.path();
-        let path_str = match path.to_str() {
-            Some(p) => p,
-            None => {
-                writeln!(error_file, "could not convert {} to string", path.display())?;
+    for dir in paths.iter() {
+        let mut small_buf = buf.split_at_mut(4 * 1024).0;
+        let wd = WalkDir::new(dir);
+        for entry in wd {
+            if entry.is_err() {
+                writeln!(error_file, "Could not enumerate an entry")?;
                 got_error = true;
                 continue;
             }
-        };
-        match process_file(
-            &path_str,
-            &mut partial_results,
-            &mut small_buf,
-            HashComputationType::Partial(4 * 1024),
-        ) {
-            Err(e) => {
-                writeln!(error_file, "{}", e)?;
-                got_error = true;
+            let f = entry.unwrap();
+            if f.file_type().is_dir() {
+                continue;
             }
-            Ok(w) => {
-                if w != 0 {
-                    let size = fs::metadata(path_str)?.len() as usize;
-                    wasted += size;
+            let path = f.path();
+            let path_str = match path.to_str() {
+                Some(p) => p,
+                None => {
+                    writeln!(error_file, "could not convert {} to string", path.display())?;
+                    got_error = true;
+                    continue;
+                }
+            };
+            match process_file(
+                &path_str,
+                &mut partial_results,
+                &mut small_buf,
+                HashComputationType::Partial(4 * 1024),
+            ) {
+                Err(e) => {
+                    writeln!(error_file, "{}", e)?;
+                    got_error = true;
+                }
+                Ok(w) => {
+                    if w != 0 {
+                        let size = fs::metadata(path_str)?.len() as usize;
+                        wasted += size;
+                    }
                 }
             }
-        }
-        if (time::precise_time_s() - last_time) as f32 > interval {
-            print!("\r");
-            print!(
-                "[{}/{}][{}] {path:<width$}",
-                current,
-                count,
-                bytesize::to_string(wasted as u64, false),
-                path = path.display(),
-                width = 100
-            );
-            if io::stdout().flush().is_err() {
-                print!("Could not flush stdio ?!");
+            if (time::precise_time_s() - last_time) as f32 > interval {
+                print!("\r");
+                print!(
+                    "[{}/{}][{}] {path:<width$}",
+                    current,
+                    count,
+                    bytesize::to_string(wasted as u64, false),
+                    path = path.display(),
+                    width = 100
+                );
+                if io::stdout().flush().is_err() {
+                    print!("Could not flush stdio ?!");
+                }
+                last_time = time::precise_time_s();
             }
-            last_time = time::precise_time_s();
+            current += 1;
         }
-        current += 1;
     }
 
     let mut count = 0;
