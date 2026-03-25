@@ -87,3 +87,24 @@ ENV/
 
 # Rope project settings
 .ropeproject
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Local toolchains / caches
+/.cargo/
+/.rustup/
+
+# Local outputs
+results.jsonl
+error-*.log
+.DS_Store
+
+# Cross toolchains (local)
+x86_64-linux-musl-cross*/
+zig-macos-*
+zig.tar.xz
+zigcc.sh
+# Local tools
+/.tools/

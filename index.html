@@ -1,161 +1,638 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
-<meta charset=utf-8>
-<style>
-body {
-  font-family: courier;
-}
-.picked {
-  background-color: rgba(128, 255, 128, 0.5);
-}
-li {
-  border-left: 4px solid black;
-  margin-bottom: 0.6em;
-  list-style: none;
-}
-</style>
+  <meta charset="utf-8">
+  <title>dupdup UI</title>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --accent: #58a6ff;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --danger: #ff7b72;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: grid;
+      grid-template-columns: 380px 1fr;
+      gap: 12px;
+      height: 100vh;
+      padding: 12px;
+    }
+    aside, main {
+      background: var(--panel);
+      border: 1px solid #222b36;
+      border-radius: 10px;
+      padding: 12px;
+      overflow: hidden;
+    }
+    h1 { margin: 0 0 8px; font-size: 20px; }
+    label { display: block; margin: 6px 0 2px; color: var(--muted); font-size: 12px; }
+    input[type=text], input[type=file], select {
+      width: 100%;
+      padding: 6px 8px;
+      border-radius: 8px;
+      border: 1px solid #30363d;
+      background: #0f1620;
+      color: var(--text);
+    }
+    button {
+      background: var(--accent);
+      color: #0d1117;
+      border: none;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-right: 6px;
+      margin-top: 8px;
+    }
+    button.secondary { background: #30363d; color: var(--text); }
+    #list {
+      height: calc(100vh - 120px);
+      overflow: auto;
+      padding-right: 6px;
+    }
+    .group {
+      border: 1px solid #283143;
+      border-radius: 10px;
+      padding: 8px;
+      margin-bottom: 8px;
+    }
+    .group-header { display:flex; justify-content:space-between; align-items:center; font-size:12px; color: var(--muted); }
+    .paths { margin-top:6px; }
+    .path-row { display:flex; align-items:center; gap:8px; font-size: 13px; padding:4px 0; }
+    .path-row input { flex-shrink:0; }
+    .path-row span { word-break: break-all; }
+    .keep { color: #7ee787; }
+    .delete { color: var(--danger); }
+    #charts { display:grid; grid-template-columns: 1fr; gap: 8px; height: 220px; }
+    #status { font-size: 12px; color: var(--muted); margin-top:6px; }
+    .pill { font-size: 11px; padding: 2px 6px; border-radius: 999px; background: #1f6feb; color:#e6edf3; margin-left:6px; }
+    .empty {
+      border: 1px dashed #2f3b4a;
+      border-radius: 10px;
+      padding: 16px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+  </style>
 </head>
 <body>
-<h1>dupdup</h1>
-<input type=file id=picker></input>
-Reject filter regexp:
-<input type=text id=filter value="lrf?m?prev"></input>
-<button id=export>export script</button>
-<ul>
-</ul>
-</body>
+  <aside>
+    <h1>dupdup</h1>
+    <div id="status">Load a report to begin.</div>
+    <label>Load report (JSON / JSONL)</label>
+    <input type="file" id="picker">
+    <label>Or fetch from server (e.g., http://127.0.0.1:3030/report)</label>
+    <input type="text" id="url" placeholder="/report">
+    <button id="fetch">Fetch</button>
+
+    <label>Filter groups (regex on any path)</label>
+    <input type="text" id="filter" placeholder="e.g. cache|@eaDir">
+
+    <label>Auto-keep first matching regex (optional)</label>
+    <input type="text" id="prefer" placeholder="e.g. /Music/production">
+
+    <label>Sort groups</label>
+    <select id="sort">
+      <option value="win">Potential reclaim (desc)</option>
+      <option value="count">Duplicate count (desc)</option>
+      <option value="size" selected>File size (desc)</option>
+      <option value="hash">Hash (asc)</option>
+    </select>
+
+    <div style="margin-top:10px;">
+      <button id="apply">Apply filters</button>
+      <button class="secondary" id="reset">Reset selections</button>
+      <button id="export">Export rm script</button>
+    </div>
+
+    <div id="charts" style="margin-top:12px;">
+      <div id="chart1"></div>
+      <div id="chart2"></div>
+    </div>
+  </aside>
+  <main>
+    <div id="list"></div>
+  </main>
+
 <script>
+let groups = [];
+let filtered = [];
+let dupCount = 0;
+let groupIndex = new Map();
+let streamOffset = 0;
+let streamBuffer = '';
+let streamActive = false;
+let streamStartedAt = 0;
+let streamLastDataAt = 0;
+let streamFileRecords = 0;
+let streamGroupRecords = 0;
 
-function download(filename, text) {
-  var el = document.createElement('a');
-  el.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(text));
-  el.setAttribute('download', filename);
-  el.style.display = 'none';
-  document.body.appendChild(el);
-
-  el.click();
-
-  document.body.removeChild(el);
+function resetData() {
+  groups = [];
+  filtered = [];
+  dupCount = 0;
+  groupIndex = new Map();
 }
 
-window.onload = function() {
-  last_picked_index = 0;
-  last_clicked_match = null;
-  filter_input = document.querySelector("#filter");
-  ignore_regexp = filter_input.value;
-  ul = document.querySelector("ul");
-  inp = document.querySelector("#picker");
-  dupes = null;
-  window.onkeypress = function(e) {
-    console.log(e.keyCode);
+function ensureGroup(hash, size) {
+  let g = groupIndex.get(hash);
+  if (!g) {
+    g = {hash, paths: [], size: size ?? null, keepSet: new Set(), pathSet: new Set()};
+    groupIndex.set(hash, g);
+    groups.push(g);
   }
+  if (size != null && (g.size == null || g.size === 0)) g.size = size;
+  return g;
+}
 
-  filter_input.onchange = function() {
-    document.querySelector("ul").innerHTML = "";
-    analyse(dupes)
+function ingestFileRecord(obj) {
+  if (!obj || !obj.hash || !obj.path) return false;
+  const g = ensureGroup(obj.hash, obj.size ?? null);
+  if (!g.pathSet.has(obj.path)) {
+    g.pathSet.add(obj.path);
+    g.paths.push(obj.path);
+    return true;
   }
-  inp.onchange = function(e) {
-    var fr = new FileReader();
-    fr.onload = function(e) {
-      dupes = JSON.parse(e.target.result);
-      analyse(dupes);
-    }
-    fr.readAsText(e.target.files[0]);
+  return false;
+}
+
+function ingestGroupRecord(obj) {
+  if (!obj || !obj.hash || !obj.paths) return false;
+  const g = ensureGroup(obj.hash, obj.size ?? null);
+  g.paths = Array.isArray(obj.paths) ? obj.paths.slice() : [];
+  g.pathSet = new Set(g.paths);
+  if (g.keepSet && g.keepSet.size) {
+    g.keepSet = new Set([...g.keepSet].filter(i => i < g.paths.length));
+  } else {
+    g.keepSet = new Set();
   }
-  function pickOne(el) {
-    var p = el.parentNode;
-    for (var i = 0; i < p.children.length; i++) {
-      if (el == p.children[i]) {
-        el.classList.toggle("picked");
-      } else {
-        p.children[i].classList.remove("picked");
+  if (obj.size != null) g.size = obj.size;
+  return true;
+}
+
+function updateDupCount() {
+  dupCount = groups.filter(g => g.paths.length > 1).length;
+}
+
+function formatBytes(bytes) {
+  if (!bytes || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let b = bytes;
+  let u = 0;
+  while (b >= 1024 && u < units.length - 1) {
+    b /= 1024;
+    u++;
+  }
+  return `${b >= 10 ? b.toFixed(1) : b.toFixed(2)} ${units[u]}`;
+}
+
+function normalize(data) {
+  const out = [];
+  if (Array.isArray(data)) return data;
+  if (typeof data === 'object') {
+    for (const [hash, val] of Object.entries(data)) {
+      if (Array.isArray(val)) {
+        out.push({hash, paths: val, size: null, keepSet: new Set(), pathSet: new Set(val)});
+      } else if (val && val.paths) {
+        out.push({hash, paths: val.paths, size: val.size ?? null, keepSet: new Set(), pathSet: new Set(val.paths)});
       }
     }
   }
+  return out;
+}
 
-  function atLeastOne(el) {
-    var p = el.parentNode;
-    for (var i = 0; i < p.children.length; i++) {
-      if (p.children[i].classList.contains("picked")) {
-        return true;
+async function loadFromUrl(url) {
+  const res = await fetch(url);
+  const text = await res.text();
+  try {
+    const obj = JSON.parse(text);
+    return normalize(obj);
+  } catch (_) {
+    const lines = text.split(/\r?\n/).filter(Boolean);
+    const arr = [];
+    const idx = new Map();
+    const ensure = (hash, size) => {
+      let g = idx.get(hash);
+      if (!g) {
+        g = {hash, paths: [], size: size ?? null, keepSet: new Set(), pathSet: new Set()};
+        idx.set(hash, g);
+        arr.push(g);
       }
-    }
-    return false;
-  }
-
-  document.body.onclick = function(e) {
-    if (e.target.classList.contains("match")) {
-      if (e.shiftKey) {
-        if (last_clicked_match) {
-          let startNode = e.target.parentNode;
-          let startNodeIndex = -1;
-          let endNodeIndex = -1;
-          var list_items = document.querySelectorAll("li");
-          for (var i = 0 ; i < list_items.length; i++) {
-            if (startNode == list_items[i]) {
-              startNodeIndex = i;
-            } else if (last_clicked_match == list_items[i]) {
-              endNodeIndex = i;
-            }
-          }
-          if (startNodeIndex == -1 || endNodeIndex == -1) {
-            throw "!?";
-          }
-          if (startNodeIndex > endNodeIndex) {
-            var tmp = endNodeIndex;
-            endNodeIndex = startNodeIndex;
-            startNodeIndex = tmp;
-          }
-
-          for (var i = startNodeIndex + 1; i <= endNodeIndex; i++) {
-            pickOne(list_items[i].children[last_picked_index]);
-          }
+      if (size != null && (g.size == null || g.size === 0)) g.size = size;
+      return g;
+    };
+    for (const line of lines) {
+      const obj = JSON.parse(line);
+      if (obj && obj.type === 'summary') {
+        continue;
+      } else if (obj && (obj.type === 'file' || (obj.hash && obj.path))) {
+        const g = ensure(obj.hash, obj.size ?? null);
+        if (!g.pathSet.has(obj.path)) {
+          g.pathSet.add(obj.path);
+          g.paths.push(obj.path);
         }
+      } else if (obj && (obj.type === 'group' || (obj.hash && obj.paths))) {
+        const g = ensure(obj.hash, obj.size ?? null);
+        g.paths = Array.isArray(obj.paths) ? obj.paths.slice() : [];
+        g.pathSet = new Set(g.paths);
       } else {
-        pickOne(e.target);
-        var node = e.target;
-        var idx = 0;
-        for (var i=0; (node=node.previousElementSibling); i++) {
-          idx++;
+        const [hash, val] = Object.entries(obj)[0];
+        if (Array.isArray(val)) {
+          const g = ensure(hash, null);
+          g.paths = val.slice();
+          g.pathSet = new Set(g.paths);
+        } else {
+          const g = ensure(hash, val.size ?? null);
+          g.paths = val.paths.slice();
+          g.pathSet = new Set(g.paths);
         }
-        last_clicked_match = e.target.parentNode;
-        last_picked_index = i;
-      }
-      e.preventDefault();
-    }
-  }
-  document.querySelector("#export").onclick = function() {
-    // check if some are not picked.
-    var to_rm = document.querySelectorAll(":not(.picked).match");
-    var script = "";
-    for (var i = 0; i < to_rm.length; i++) {
-      if (atLeastOne(to_rm[i])) {
-        script += "rm \"" + to_rm[i].textContent + "\"\n";
       }
     }
-    download("remove_script.sh", script);
+    return arr;
   }
 }
 
-function analyse(dupes) {
-  var sorted = [];
-  var reg = new RegExp(filter_input.value);
-  for (var i in dupes) {
-    if (!dupes[i][0].match(reg)) {
-      var str = "";
-      for (var dupe in dupes[i]) {
-        str += '<div class="match">' + dupes[i][dupe] + "</div> ";
+function processStreamText(text) {
+  if (!text) return;
+  streamBuffer += text;
+  const lines = streamBuffer.split(/\r?\n/);
+  streamBuffer = lines.pop() || '';
+  let updated = false;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const obj = JSON.parse(line);
+      if (obj && obj.type === 'summary') {
+        updated = updated || false;
+      } else if (obj && (obj.type === 'file' || (obj.hash && obj.path))) {
+        updated = ingestFileRecord(obj) || updated;
+        streamFileRecords += 1;
+      } else if (obj && (obj.type === 'group' || (obj.hash && obj.paths))) {
+        updated = ingestGroupRecord(obj) || updated;
+        streamGroupRecords += 1;
+      } else {
+        const [h, val] = Object.entries(obj)[0];
+        if (Array.isArray(val)) {
+          updated = ingestGroupRecord({hash: h, paths: val}) || updated;
+        } else {
+          updated = ingestGroupRecord({hash: h, paths: val.paths, size: val.size ?? null}) || updated;
+        }
+        streamGroupRecords += 1;
       }
-      sorted.push(str)
+    } catch (_) {
+      // keep partial line in buffer
+      streamBuffer = line + (streamBuffer ? "\n" + streamBuffer : "");
+      break;
     }
   }
-  sorted.sort();
-  for (var i in sorted) {
-    var li = document.createElement("li");
-    li.innerHTML = sorted[i];
-    ul.appendChild(li);
+  if (lines.length) {
+    streamLastDataAt = Date.now();
+  }
+  if (updated) {
+    updateDupCount();
+    applyFilters();
   }
 }
+
+async function pollStream() {
+  if (!streamActive) return;
+  try {
+    const res = await fetch(`/report?offset=${streamOffset}`, {cache: 'no-store'});
+    if (res.ok) {
+      const buf = await res.arrayBuffer();
+      if (buf.byteLength) {
+        const text = new TextDecoder().decode(buf);
+        streamOffset += buf.byteLength;
+        processStreamText(text);
+      } else if (filtered.length === 0) {
+        document.getElementById('status').textContent = streamStatusText();
+      }
+    }
+  } catch (_) {
+    // ignore and retry
+  }
+  setTimeout(pollStream, 1000);
+}
+
+function startStreaming() {
+  if (streamActive) return;
+  streamActive = true;
+  streamOffset = 0;
+  streamBuffer = '';
+  streamStartedAt = Date.now();
+  streamLastDataAt = 0;
+  streamFileRecords = 0;
+  streamGroupRecords = 0;
+  resetData();
+  document.getElementById('status').textContent = streamStatusText();
+  renderList();
+  pollStream();
+}
+
+function stopStreaming() {
+  streamActive = false;
+}
+
+function potentialWin(g) {
+  if (!g.size) return 0;
+  const delCount = g.keepSet && g.keepSet.size > 0 ? (g.paths.length - g.keepSet.size) : 0;
+  return g.size * delCount;
+}
+
+function streamStatusText() {
+  const now = Date.now();
+  const elapsed = ((now - streamStartedAt) / 1000).toFixed(1);
+  const since = streamLastDataAt ? ((now - streamLastDataAt) / 1000).toFixed(1) : null;
+  let msg = `Streaming /report... ${formatBytes(streamOffset)} received • ${streamFileRecords} files • ${streamGroupRecords} groups • ${elapsed}s`;
+  if (!streamLastDataAt) msg += ' • waiting for first data';
+  else if (since && Number(since) >= 5) msg += ` • last data ${since}s ago`;
+  return msg;
+}
+
+function renderList() {
+  const list = document.getElementById('list');
+  list.innerHTML = '';
+  if (!filtered.length) {
+    const div = document.createElement('div');
+    div.className = 'empty';
+    if (streamActive) {
+      const msg = groups.length === 0
+        ? 'Waiting for data from the scanner…'
+        : 'No duplicates yet (still scanning).';
+      div.textContent = msg;
+    } else {
+      div.textContent = 'No duplicates to show.';
+    }
+    list.appendChild(div);
+  }
+  filtered.forEach((g, idx) => {
+    const div = document.createElement('div');
+    div.className = 'group';
+    const header = document.createElement('div');
+    header.className = 'group-header';
+    const win = potentialWin(g);
+    const winLabel = win ? `${formatBytes(win)} reclaim` : 'select to compute';
+    const sizeLabel = g.size ? formatBytes(g.size) : 'size unknown';
+    header.innerHTML = `<span>Group ${idx+1} • ${g.paths.length} files • ${sizeLabel} each</span><span>${winLabel}</span>`;
+    div.appendChild(header);
+    const paths = document.createElement('div');
+    paths.className = 'paths';
+    g.paths.forEach((p, i) => {
+      const row = document.createElement('div');
+      row.className = 'path-row';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = g.keepSet?.has(i);
+      cb.onchange = () => {
+        if (!g.keepSet) g.keepSet = new Set();
+        if (cb.checked) g.keepSet.add(i); else g.keepSet.delete(i);
+        renderList();
+      };
+      const label = document.createElement('span');
+      label.textContent = p;
+      const kept = g.keepSet?.has(i);
+      label.className = kept ? 'keep' : 'delete';
+      const pill = document.createElement('span');
+      pill.className = 'pill';
+      pill.textContent = kept ? 'KEEP' : 'DELETE';
+      const actions = document.createElement('div');
+      actions.style.display = 'flex';
+      actions.style.gap = '6px';
+      actions.style.marginLeft = 'auto';
+
+      const revealBtn = document.createElement('button');
+      revealBtn.textContent = 'Reveal';
+      revealBtn.className = 'secondary';
+      revealBtn.onclick = async (e) => {
+        e.stopPropagation();
+        await fetch('/reveal', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({path: p})
+        });
+      };
+
+      const delBtn = document.createElement('button');
+      delBtn.textContent = 'Delete now';
+      delBtn.className = 'secondary';
+      delBtn.onclick = async (e) => {
+        e.stopPropagation();
+        if (!confirm(`Delete this file?\n${p}`)) return;
+        const res = await fetch('/delete', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify([p])
+        });
+        if (!res.ok) { alert('Delete failed'); return; }
+        // remove from group
+        g.paths = g.paths.filter((_, idx) => idx !== i);
+        if (g.pathSet) g.pathSet.delete(p);
+        if (g.keepSet) g.keepSet = new Set([...g.keepSet].filter(k => k !== i));
+        if (g.paths.length === 0) {
+          filtered = filtered.filter(x => x !== g);
+          groups = groups.filter(x => x !== g);
+          if (groupIndex) groupIndex.delete(g.hash);
+        }
+        renderList();
+      };
+
+      actions.appendChild(revealBtn);
+      actions.appendChild(delBtn);
+
+      row.appendChild(cb); row.appendChild(label); row.appendChild(pill); row.appendChild(actions);
+      row.appendChild(pill);
+      paths.appendChild(row);
+    });
+    div.appendChild(paths);
+    list.appendChild(div);
+  });
+  const totalWin = filtered.reduce((acc,g)=>acc+potentialWin(g),0);
+  if (!filtered.length && streamActive) {
+    document.getElementById('status').textContent = streamStatusText();
+  } else {
+    document.getElementById('status').textContent = `${filtered.length} groups shown • ${dupCount} total groups • projected savings (current selection): ${formatBytes(totalWin)}`;
+  }
+  drawCharts();
+}
+
+function sortFiltered() {
+  const choice = document.getElementById('sort').value;
+  filtered.sort((a,b)=>{
+    if (choice === 'win') return potentialWin(b) - potentialWin(a);
+    if (choice === 'count') return b.paths.length - a.paths.length;
+    if (choice === 'size') return (b.size||0) - (a.size||0);
+    return a.hash.localeCompare(b.hash);
+  });
+}
+
+function applyFilters() {
+  const filter = document.getElementById('filter').value;
+  const prefer = document.getElementById('prefer').value;
+  const reg = filter ? new RegExp(filter) : null;
+  filtered = groups.filter(g => g.paths.length > 1 && (!reg || !g.paths.some(p => reg.test(p))));
+  if (prefer) {
+    const prefReg = new RegExp(prefer);
+    filtered.forEach(g => {
+      const idx = g.paths.findIndex(p => prefReg.test(p));
+      if (idx >= 0) { g.keepSet = new Set([idx]); }
+    });
+  }
+  sortFiltered();
+  renderList();
+}
+
+function resetSelections() {
+  filtered.forEach(g => g.keepSet = new Set());
+  renderList();
+}
+
+function exportScript() {
+  let lines = [];
+  filtered.forEach(g => {
+    g.paths.forEach((p, i) => {
+      const del = g.keepSet && g.keepSet.size > 0 ? !g.keepSet.has(i) : false;
+      if (del) lines.push(`rm "${p}"`);
+    });
+  });
+  const blob = new Blob([lines.join('\n') + '\n'], {type: 'text/plain'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'remove_script.sh';
+  a.click();
+}
+
+async function deleteFiles() {
+  const paths = [];
+  filtered.forEach(g => {
+    g.paths.forEach((p, i) => {
+      const del = g.keepSet && g.keepSet.size > 0 ? !g.keepSet.has(i) : false;
+      if (del) paths.push(p);
+    });
+  });
+  if (!paths.length) { alert('Nothing to delete.'); return; }
+  if (!confirm(`Delete ${paths.length} files now? This cannot be undone.`)) return;
+  const res = await fetch('/delete', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(paths),
+  });
+  if (!res.ok) {
+    alert('Delete failed: ' + res.status);
+    return;
+  }
+  const result = await res.json();
+  alert(`Deleted: ${result.deleted}, failed: ${result.failed.length}`);
+}
+
+function drawCharts() {
+  const c1 = echarts.init(document.getElementById('chart1'));
+  const c2 = echarts.init(document.getElementById('chart2'));
+  const sizeBuckets = {};
+  filtered.forEach(g => {
+    const n = g.paths.length;
+    sizeBuckets[n] = (sizeBuckets[n] || 0) + 1;
+  });
+  const bucketData = Object.entries(sizeBuckets).sort((a,b)=>Number(a[0])-Number(b[0]));
+  c1.setOption({
+    backgroundColor: '#161b22',
+    title: {text: 'Group sizes', textStyle:{color:'#e6edf3',fontSize:12}},
+    xAxis: {type:'category', data: bucketData.map(([k])=>k), axisLabel:{color:'#8b949e'}},
+    yAxis: {type:'value', axisLabel:{color:'#8b949e'}},
+    series: [{type:'bar', data: bucketData.map(([,v])=>v), itemStyle:{color:'#58a6ff'}}],
+    grid:{left:40,right:10,bottom:30,top:30}
+  });
+
+  const dirCounts = {};
+  filtered.forEach(g => {
+    g.paths.forEach(p => {
+      const parts = p.split('/').filter(Boolean);
+      const key = parts.slice(0,3).join('/');
+      dirCounts[key] = (dirCounts[key] || 0) + 1;
+    });
+  });
+  const topDirs = Object.entries(dirCounts).sort((a,b)=>b[1]-a[1]).slice(0,12);
+  c2.setOption({
+    backgroundColor: '#161b22',
+    title: {text: 'Top directories (by dup files)', textStyle:{color:'#e6edf3',fontSize:12}},
+    xAxis: {type:'value', axisLabel:{color:'#8b949e'}},
+    yAxis: {type:'category', data: topDirs.map(([k])=>k), axisLabel:{color:'#8b949e'}},
+    series: [{type:'bar', data: topDirs.map(([,v])=>v), itemStyle:{color:'#7ee787'}}],
+    grid:{left:130,right:20,bottom:30,top:30}
+  });
+}
+
+function handleFile(file) {
+  const fr = new FileReader();
+  fr.onload = async (e) => {
+    const text = e.target.result;
+    try {
+      const obj = JSON.parse(text);
+      stopStreaming();
+      resetData();
+      normalize(obj).forEach(g => ingestGroupRecord(g));
+    } catch (_) {
+      const lines = text.split(/\r?\n/).filter(Boolean);
+      stopStreaming();
+      resetData();
+      lines.forEach(l => {
+        const obj = JSON.parse(l);
+        if (obj && obj.type === 'summary') {
+          return;
+        } else if (obj && (obj.type === 'file' || (obj.hash && obj.path))) {
+          ingestFileRecord(obj);
+        } else if (obj && (obj.type === 'group' || (obj.hash && obj.paths))) {
+          ingestGroupRecord(obj);
+        } else {
+          const [h,val] = Object.entries(obj)[0];
+          if (Array.isArray(val)) ingestGroupRecord({hash: h, paths: val});
+          else ingestGroupRecord({hash: h, paths: val.paths, size: val.size ?? null});
+        }
+      });
+    }
+    updateDupCount();
+    applyFilters();
+  };
+  fr.readAsText(file);
+}
+
+document.getElementById('picker').onchange = (e) => {
+  if (e.target.files.length) handleFile(e.target.files[0]);
+};
+
+document.getElementById('fetch').onclick = async () => {
+  const url = document.getElementById('url').value || '/report';
+  stopStreaming();
+  resetData();
+  const loaded = await loadFromUrl(url);
+  loaded.forEach(g => ingestGroupRecord(g));
+  updateDupCount();
+  applyFilters();
+};
+
+document.getElementById('apply').onclick = applyFilters;
+document.getElementById('reset').onclick = resetSelections;
+document.getElementById('export').onclick = exportScript;
+const deleteBtn = document.createElement('button');
+deleteBtn.textContent = 'Delete non-kept (danger)';
+deleteBtn.className = 'secondary';
+deleteBtn.onclick = deleteFiles;
+document.querySelector('aside').appendChild(deleteBtn);
+document.getElementById('sort').onchange = () => { sortFiltered(); renderList(); };
+
+window.addEventListener('resize', drawCharts);
+
+// Auto-stream /report on load if available
+startStreaming();
 </script>
+</body>
 </html>
