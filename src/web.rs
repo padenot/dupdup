@@ -7,6 +7,10 @@ use tiny_http::{Header, Response, Server};
 
 const INDEX_HTML: &[u8] = include_bytes!("../index.html");
 
+fn header(name: &[u8], value: &[u8]) -> Option<Header> {
+    Header::from_bytes(name, value).ok()
+}
+
 fn is_tailscale_ipv4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000
@@ -67,9 +71,11 @@ pub(crate) fn serve_http(report_path: PathBuf, port: u16) -> Option<JoinHandle<(
                     let url = request.url();
                     let (path, query) = url.split_once('?').unwrap_or((url, ""));
                     if path == "/" || path.starts_with("/index") {
-                        let _ = request.respond(Response::from_data(INDEX_HTML).with_header(
-                            Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap(),
-                        ));
+                        let mut response = Response::from_data(INDEX_HTML);
+                        if let Some(content_type) = header(b"Content-Type", b"text/html") {
+                            response = response.with_header(content_type);
+                        }
+                        let _ = request.respond(response);
                         continue;
                     }
                     if path.starts_with("/report") {
@@ -99,14 +105,14 @@ pub(crate) fn serve_http(report_path: PathBuf, port: u16) -> Option<JoinHandle<(
                             std::fs::read(&report_path_clone).ok()
                         };
                         if let Some(bytes) = bytes {
-                            let mut resp = Response::from_data(bytes).with_header(
-                                Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                                    .unwrap(),
-                            );
-                            let _ = resp.add_header(
-                                Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..])
-                                    .unwrap(),
-                            );
+                            let mut resp = Response::from_data(bytes);
+                            if let Some(content_type) = header(b"Content-Type", b"application/json")
+                            {
+                                resp = resp.with_header(content_type);
+                            }
+                            if let Some(cache_control) = header(b"Cache-Control", b"no-store") {
+                                let _ = resp.add_header(cache_control);
+                            }
                             let _ = request.respond(resp);
                         } else {
                             let _ = request.respond(
@@ -131,12 +137,11 @@ pub(crate) fn serve_http(report_path: PathBuf, port: u16) -> Option<JoinHandle<(
                             }
                         }
                         let resp = serde_json::json!({ "deleted": deleted, "failed": failed });
-                        let _ = request.respond(
-                            Response::from_data(resp.to_string()).with_header(
-                                Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                                    .unwrap(),
-                            ),
-                        );
+                        let mut response = Response::from_data(resp.to_string());
+                        if let Some(content_type) = header(b"Content-Type", b"application/json") {
+                            response = response.with_header(content_type);
+                        }
+                        let _ = request.respond(response);
                         continue;
                     }
                     if path.starts_with("/reveal") {
@@ -159,15 +164,12 @@ pub(crate) fn serve_http(report_path: PathBuf, port: u16) -> Option<JoinHandle<(
                                 .map(|p| p.to_path_buf())
                                 .unwrap_or_else(|| PathBuf::from(&p));
                             let _ = open::that(target);
-                            let _ = request.respond(
-                                Response::from_data("{\"status\":\"ok\"}").with_header(
-                                    Header::from_bytes(
-                                        &b"Content-Type"[..],
-                                        &b"application/json"[..],
-                                    )
-                                    .unwrap(),
-                                ),
-                            );
+                            let mut response = Response::from_data("{\"status\":\"ok\"}");
+                            if let Some(content_type) = header(b"Content-Type", b"application/json")
+                            {
+                                response = response.with_header(content_type);
+                            }
+                            let _ = request.respond(response);
                         } else {
                             let _ = request.respond(
                                 Response::from_string("bad request").with_status_code(400),

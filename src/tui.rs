@@ -8,7 +8,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
-    widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline},
+    widgets::{Block, Borders, Clear, Gauge, Paragraph},
     Terminal,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -30,10 +30,16 @@ const ERROR_BUFFER_LIMIT: usize = 8;
 pub(crate) struct LiveStats {
     pub(crate) total_files: usize,
     pub(crate) total_candidates: usize,
+    pub(crate) partial_enabled: bool,
     pub(crate) partial_total: u64,
     pub(crate) full_total: Arc<AtomicU64>,
     pub(crate) partial_done: Arc<AtomicU64>,
     pub(crate) full_done: Arc<AtomicU64>,
+    pub(crate) audio_metadata_total: Arc<AtomicU64>,
+    pub(crate) audio_metadata_done: Arc<AtomicU64>,
+    pub(crate) audio_fingerprint_total: Arc<AtomicU64>,
+    pub(crate) audio_fingerprint_done: Arc<AtomicU64>,
+    pub(crate) scan_phase: Arc<AtomicU64>,
     pub(crate) partial_bytes: Arc<AtomicU64>,
     pub(crate) full_bytes: Arc<AtomicU64>,
     pub(crate) files_done: Arc<AtomicU64>,
@@ -52,7 +58,6 @@ pub(crate) struct LiveStats {
     pub(crate) dup_selected: Arc<Mutex<DupSelection>>,
     pub(crate) dup_expanded: Arc<Mutex<HashSet<String>>>,
     pub(crate) full_groups: Arc<Mutex<HashMap<String, (u64, Vec<PathBuf>)>>>,
-    pub(crate) start: Instant,
 }
 
 #[derive(Clone)]
@@ -189,22 +194,58 @@ pub(crate) fn start_tui(stats: LiveStats) -> Option<JoinHandle<()>> {
             let mut last_bytes = 0u64;
             let mut last_files = 0u64;
             let mut last_draw_time = Instant::now();
+            let mut phase_start_time = Instant::now();
+            let mut phase_start_bytes = 0u64;
+            let mut phase_start_files = 0u64;
+            let mut phase_start_audio_metadata = 0u64;
+            let mut phase_start_audio_fingerprint = 0u64;
+            let mut last_audio_metadata = 0u64;
+            let mut last_audio_fingerprint = 0u64;
             let mut speed_series: VecDeque<u64> = VecDeque::with_capacity(120);
+            let mut smoothed_rate = 0.0f64;
             let mut last_dup_height = 6usize;
             let mut dup_sort = DupSort::Gain;
             let mut confirm_state: Option<ConfirmState> = None;
             let mut confirm_skip = false;
+            let mut last_phase = u64::MAX;
             loop {
-                let elapsed = stats.start.elapsed().as_secs_f64().max(0.0001);
+                let scan_phase = stats.scan_phase.load(Ordering::Relaxed);
+                if scan_phase != last_phase {
+                    speed_series.clear();
+                    last_bytes = 0;
+                    last_files = 0;
+                    last_draw_time = Instant::now();
+                    phase_start_time = Instant::now();
+                    phase_start_bytes = stats.partial_bytes.load(Ordering::Relaxed)
+                        + stats.full_bytes.load(Ordering::Relaxed);
+                    phase_start_files = stats.files_done.load(Ordering::Relaxed);
+                    phase_start_audio_metadata = stats.audio_metadata_done.load(Ordering::Relaxed);
+                    phase_start_audio_fingerprint =
+                        stats.audio_fingerprint_done.load(Ordering::Relaxed);
+                    last_audio_metadata = phase_start_audio_metadata;
+                    last_audio_fingerprint = phase_start_audio_fingerprint;
+                    smoothed_rate = 0.0;
+                    last_phase = scan_phase;
+                }
                 let partial_done = stats.partial_done.load(Ordering::Relaxed);
                 let partial_total = stats.partial_total;
                 let full_done = stats.full_done.load(Ordering::Relaxed);
                 let full_total = stats.full_total.load(Ordering::Relaxed).max(1);
+                let audio_metadata_done = stats.audio_metadata_done.load(Ordering::Relaxed);
+                let audio_metadata_total = stats.audio_metadata_total.load(Ordering::Relaxed);
+                let audio_fingerprint_done = stats.audio_fingerprint_done.load(Ordering::Relaxed);
+                let audio_fingerprint_total = stats.audio_fingerprint_total.load(Ordering::Relaxed);
                 let bytes = stats.partial_bytes.load(Ordering::Relaxed)
                     + stats.full_bytes.load(Ordering::Relaxed);
                 let files = stats.files_done.load(Ordering::Relaxed);
-                let bps = bytes as f64 / elapsed;
-                let _fps = files as f64 / elapsed;
+                let phase_elapsed = phase_start_time.elapsed().as_secs_f64().max(0.0001);
+                let phase_bytes = bytes.saturating_sub(phase_start_bytes);
+                let phase_files = files.saturating_sub(phase_start_files);
+                let bps = phase_bytes as f64 / phase_elapsed;
+                let phase_audio_metadata =
+                    audio_metadata_done.saturating_sub(phase_start_audio_metadata);
+                let phase_audio_fingerprint =
+                    audio_fingerprint_done.saturating_sub(phase_start_audio_fingerprint);
 
                 let partial_ratio = if partial_total > 0 {
                     (partial_done as f64 / partial_total as f64).clamp(0.0, 1.0)
@@ -212,37 +253,92 @@ pub(crate) fn start_tui(stats: LiveStats) -> Option<JoinHandle<()>> {
                     1.0
                 };
                 let full_ratio = (full_done as f64 / full_total as f64).clamp(0.0, 1.0);
+                let audio_ratio = if audio_fingerprint_total > 0 {
+                    (audio_fingerprint_done as f64 / audio_fingerprint_total as f64).clamp(0.0, 1.0)
+                } else if audio_metadata_total > 0 {
+                    (audio_metadata_done as f64 / audio_metadata_total as f64).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let audio_status_line = if audio_fingerprint_total > 0 {
+                    format!(
+                        "probe {}/{} | fingerprint {}/{}",
+                        audio_metadata_done,
+                        audio_metadata_total,
+                        audio_fingerprint_done,
+                        audio_fingerprint_total
+                    )
+                } else if audio_metadata_total > 0 {
+                    format!("probe {}/{}", audio_metadata_done, audio_metadata_total)
+                } else {
+                    "idle".to_string()
+                };
+                let potential_bytes = stats.potential_waste.lock().map(|v| *v).unwrap_or(0);
 
-                let _delta_bytes = bytes.saturating_sub(last_bytes);
-                last_bytes = bytes;
-                // compute instantaneous files/sec since last draw; store with one decimal resolution
-                let delta_files = files.saturating_sub(last_files);
                 let now = Instant::now();
                 let dt = now.duration_since(last_draw_time).as_secs_f64().max(0.001);
-                last_files = files;
                 last_draw_time = now;
-                let inst_fps = ((delta_files as f64 / dt) * 10.0).round() as u64; // files/sec *10
-                speed_series.push_back(inst_fps);
+                let (inst_rate, spark_title, info) = if scan_phase == 3 {
+                    let (phase_units, delta_units, title) = if audio_fingerprint_total > 0 {
+                        let delta = audio_fingerprint_done.saturating_sub(last_audio_fingerprint);
+                        last_audio_fingerprint = audio_fingerprint_done;
+                        (
+                            phase_audio_fingerprint,
+                            delta,
+                            "Fingerprint/s (~6s)".to_string(),
+                        )
+                    } else {
+                        let delta = audio_metadata_done.saturating_sub(last_audio_metadata);
+                        last_audio_metadata = audio_metadata_done;
+                        (phase_audio_metadata, delta, "Probe/s (~6s)".to_string())
+                    };
+                    let inst_scaled = ((delta_units as f64 / dt) * 10.0).round() as u64;
+                    let inst_display = inst_scaled as f64 / 10.0;
+                    let panel = format!(
+                        "phase-audio {:>6} | total-files {:>6}/{:>6} | dup-cands {:>6} | audio-status {} | inst {:.1} audio/s | potential {}",
+                        phase_units,
+                        files,
+                        stats.total_files,
+                        stats.total_candidates,
+                        audio_status_line,
+                        inst_display,
+                        format_bytes_binary_u128(potential_bytes)
+                    );
+                    (inst_scaled as f64 / 10.0, title, panel)
+                } else {
+                    let delta_files = files.saturating_sub(last_files);
+                    last_files = files;
+                    let inst_scaled = ((delta_files as f64 / dt) * 10.0).round() as u64;
+                    let inst_display = inst_scaled as f64 / 10.0;
+                    let panel = format!(
+                        "phase-files {:>6} | total-files {:>6}/{:>6} | dup-cands {:>6} | phase-bytes {:.2} MiB | phase-avg {:.2} MiB/s | inst {:.1} files/s | potential {}",
+                        phase_files,
+                        files,
+                        stats.total_files,
+                        stats.total_candidates,
+                        phase_bytes as f64 / (1024.0 * 1024.0),
+                        bps / (1024.0 * 1024.0),
+                        inst_display,
+                        format_bytes_binary_u128(potential_bytes)
+                    );
+                    (
+                        inst_scaled as f64 / 10.0,
+                        "Files/s (~6s)".to_string(),
+                        panel,
+                    )
+                };
+                let _delta_bytes = bytes.saturating_sub(last_bytes);
+                last_bytes = bytes;
+                smoothed_rate = if smoothed_rate == 0.0 {
+                    inst_rate
+                } else {
+                    smoothed_rate * 0.65 + inst_rate * 0.35
+                };
+                speed_series.push_back((smoothed_rate * 10.0).round() as u64);
                 if speed_series.len() > 60 {
                     speed_series.pop_front();
                 }
 
-                let inst_fps_display = if let Some(last) = speed_series.back() {
-                    *last as f64 / 10.0
-                } else {
-                    0.0
-                };
-                let potential_bytes = stats.potential_waste.lock().map(|v| *v).unwrap_or(0);
-                let info = format!(
-                    "files {:>6}/{:>6} | dup-cands {:>6} | bytes {:.2} MiB | avg {:.2} MiB/s | inst {:.1} files/s | potential {}",
-                    files,
-                    stats.total_files,
-                    stats.total_candidates,
-                    bytes as f64 / (1024.0 * 1024.0),
-                    bps / (1024.0 * 1024.0),
-                    inst_fps_display,
-                    format_bytes_binary_u128(potential_bytes)
-                );
                 let savings_bytes = stats.potential_waste.lock().map(|v| *v).unwrap_or(0);
                 let settings_line = format!(
                     "{} savings:{}",
@@ -275,6 +371,13 @@ pub(crate) fn start_tui(stats: LiveStats) -> Option<JoinHandle<()>> {
                     path_lines.push(current_path.clone());
                 }
                 let path_text = path_lines.join("\n");
+                let current_work_title = match scan_phase {
+                    0 => "Current discovery",
+                    1 => "Current candidate work",
+                    2 => "Current exact-hash work",
+                    3 => "Current audio work",
+                    _ => "Current work",
+                };
                 let error_count = stats.error_count.load(Ordering::Relaxed);
                 let mut error_lines = Vec::new();
                 error_lines.push(format!("errors: {}", error_count));
@@ -497,6 +600,7 @@ pub(crate) fn start_tui(stats: LiveStats) -> Option<JoinHandle<()>> {
                     DupSort::Size => "size",
                 };
                 let base_title = match stage {
+                    3 => format!("Top audio-equivalent groups (sort: {})", sort_label),
                     2 => format!("Top candidates (size, sort: {})", sort_label),
                     1 => format!("Top candidates (partial, sort: {})", sort_label),
                     _ => format!("Top duplicates (sort: {})", sort_label),
@@ -510,6 +614,7 @@ pub(crate) fn start_tui(stats: LiveStats) -> Option<JoinHandle<()>> {
                             Constraint::Length(3),
                             Constraint::Length(3),
                             Constraint::Length(3),
+                            Constraint::Length(3),
                             Constraint::Length(6),
                             Constraint::Length(3),
                             Constraint::Length(3),
@@ -519,56 +624,107 @@ pub(crate) fn start_tui(stats: LiveStats) -> Option<JoinHandle<()>> {
                         ])
                         .split(size);
 
+                    let partial_title = if stats.partial_enabled {
+                        "Candidate hash filter"
+                    } else {
+                        "Candidate selection (size)"
+                    };
                     let partial = Gauge::default()
-                        .block(Block::default().title("Partial pass").borders(Borders::ALL))
+                        .block(Block::default().title(partial_title).borders(Borders::ALL))
                         .gauge_style(Style::default().fg(Color::Cyan))
+                        .label(format!("{}/{}", partial_done, partial_total))
                         .ratio(partial_ratio);
                     f.render_widget(partial, chunks[0]);
 
+                    let full_title = if stats.partial_enabled {
+                        "Exact hash verification"
+                    } else {
+                        "Exact hash scan"
+                    };
                     let full = Gauge::default()
-                        .block(Block::default().title("Full pass").borders(Borders::ALL))
+                        .block(Block::default().title(full_title).borders(Borders::ALL))
                         .gauge_style(Style::default().fg(Color::Green))
+                        .label(format!("{}/{}", full_done, full_total))
                         .ratio(full_ratio);
                     f.render_widget(full, chunks[1]);
 
-                    let speed = Paragraph::new(info.clone())
-                        .block(Block::default().borders(Borders::ALL).title("Speed"));
-                    f.render_widget(speed, chunks[2]);
-
-                    let spark_data: Vec<u64> = speed_series.clone().into_iter().collect::<Vec<_>>();
-                    let max_speed = spark_data.iter().cloned().max().unwrap_or(1).max(1);
-                    let spark_top = max_speed as f64 / 10.0;
-                    let spark = Sparkline::default()
+                    let audio = Gauge::default()
                         .block(
                             Block::default()
-                                .borders(Borders::ALL)
-                                .title(format!("Files/s (~6s) top {:.1}", spark_top)),
+                                .title("Audio analysis")
+                                .borders(Borders::ALL),
                         )
-                        .style(Style::default().fg(Color::Magenta))
-                        .max(max_speed)
-                        .data(&spark_data);
-                    f.render_widget(spark, chunks[3]);
+                        .gauge_style(Style::default().fg(Color::Yellow))
+                        .label(audio_status_line.clone())
+                        .ratio(audio_ratio);
+                    f.render_widget(audio, chunks[2]);
+
+                    let speed = Paragraph::new(info.clone())
+                        .block(Block::default().borders(Borders::ALL).title("Speed"));
+                    f.render_widget(speed, chunks[3]);
+
+                    let spark_panel = if scan_phase == 3 {
+                        let rate_text = if audio_fingerprint_total > 0 {
+                            format!(
+                                "fingerprint {}/{} | phase-audio {} | {}",
+                                audio_fingerprint_done,
+                                audio_fingerprint_total,
+                                phase_audio_fingerprint,
+                                spark_title
+                            )
+                        } else {
+                            format!(
+                                "probe {}/{} | phase-audio {} | {}",
+                                audio_metadata_done,
+                                audio_metadata_total,
+                                phase_audio_metadata,
+                                spark_title
+                            )
+                        };
+                        Paragraph::new(rate_text)
+                            .block(Block::default().borders(Borders::ALL).title("Audio rate"))
+                    } else {
+                        let raw_spark: Vec<u64> = speed_series.iter().copied().collect();
+                        let spark_width = chunks[4].width.saturating_sub(2).max(1) as usize;
+                        let spark_data: Vec<u64> = if raw_spark.is_empty() {
+                            vec![0; spark_width]
+                        } else if raw_spark.len() >= spark_width {
+                            raw_spark[raw_spark.len() - spark_width..].to_vec()
+                        } else {
+                            let mut padded = vec![0; spark_width - raw_spark.len()];
+                            padded.extend(raw_spark);
+                            padded
+                        };
+                        let max_speed = spark_data.iter().cloned().max().unwrap_or(1).max(1);
+                        let spark_top = max_speed as f64 / 10.0;
+                        Paragraph::new(format!(
+                            "recent throughput | {} top {:.1}",
+                            spark_title, spark_top
+                        ))
+                        .block(Block::default().borders(Borders::ALL).title("Rate"))
+                    };
+                    f.render_widget(spark_panel, chunks[4]);
 
                     let settings_p = Paragraph::new(settings_line.clone())
                         .block(Block::default().borders(Borders::ALL).title("Settings"));
-                    f.render_widget(settings_p, chunks[4]);
+                    f.render_widget(settings_p, chunks[5]);
 
                     let status_p = Paragraph::new(status_line.clone())
                         .block(Block::default().borders(Borders::ALL).title("Status"));
-                    f.render_widget(status_p, chunks[5]);
+                    f.render_widget(status_p, chunks[6]);
 
                     let errors_p = Paragraph::new(error_text.clone())
                         .block(Block::default().borders(Borders::ALL).title("Errors"));
-                    f.render_widget(errors_p, chunks[6]);
+                    f.render_widget(errors_p, chunks[7]);
 
                     let path_p = Paragraph::new(path_text.clone()).block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title("Current files (press q to hide)"),
+                            .title(current_work_title),
                     );
-                    f.render_widget(path_p, chunks[7]);
+                    f.render_widget(path_p, chunks[8]);
 
-                    let dup_height = chunks[8].height.saturating_sub(2).max(1) as usize;
+                    let dup_height = chunks[9].height.saturating_sub(2).max(1) as usize;
                     last_dup_height = dup_height;
                     let mut dup_scroll = stats.dup_scroll.load(Ordering::Relaxed) as usize;
                     let max_scroll = dup_lines.len().saturating_sub(dup_height);
@@ -599,7 +755,7 @@ pub(crate) fn start_tui(stats: LiveStats) -> Option<JoinHandle<()>> {
                     };
                     let dup_p = Paragraph::new(shown.join("\n"))
                         .block(Block::default().borders(Borders::ALL).title(dup_title));
-                    f.render_widget(dup_p, chunks[8]);
+                    f.render_widget(dup_p, chunks[9]);
 
                     if let Some(confirm) = &confirm_state {
                         let confirm_height =
@@ -763,9 +919,6 @@ pub(crate) fn start_tui(stats: LiveStats) -> Option<JoinHandle<()>> {
                             continue;
                         }
 
-                        if k.code == KeyCode::Char('q') {
-                            break;
-                        }
                         let scroll_amt = last_dup_height.max(1);
                         if k.code == KeyCode::Char('c')
                             && k.modifiers.contains(KeyModifiers::CONTROL)

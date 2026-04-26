@@ -1,20 +1,22 @@
-use crate::config::{Config, Preset};
+use crate::audio::{analyze_audio_duplicates, AudioAnalysisProgress};
+use crate::config::{Config, Preset, RunMode};
+use crate::diagnostics::ErrorLog;
+use crate::file_tools::{
+    collect_inventory, file_mtime_secs, hash_full, hash_prefix, InventoryEntryKind,
+};
 use crate::hard_drive::{disk_info, disk_layout, dump_detection, format_disk_layout};
 use crate::tui::{start_tui, DupEntry, DupSelection, LiveStats};
 use crate::util::{format_bytes_binary, format_bytes_binary_u128};
 use crate::web::{best_ui_url, open_http_ui, serve_http};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use atty::Stream;
-use blake3::Hasher;
-use env_logger::Builder;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use log::LevelFilter;
 use rayon::prelude::*;
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -24,16 +26,33 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use time::{macros::format_description, OffsetDateTime};
-use walkdir::WalkDir;
+use tracing::{info, warn};
+use tracing_subscriber::fmt::time::OffsetTime;
+use tracing_subscriber::EnvFilter;
 
-fn init_logging(force: bool) {
+fn init_tracing(mode: &RunMode, force: bool, use_tui: bool) {
     static LOGGER_INIT: Once = Once::new();
     LOGGER_INIT.call_once(|| {
-        let mut builder = Builder::from_default_env();
-        if force {
-            builder.filter_level(LevelFilter::Trace);
-        }
-        let _ = builder.try_init();
+        let timer = OffsetTime::new(
+            time::UtcOffset::UTC,
+            time::format_description::well_known::Rfc3339,
+        );
+        let default_directive = if force || *mode == RunMode::Diagnostic {
+            "dupdup=trace"
+        } else if use_tui {
+            "dupdup=error"
+        } else {
+            "dupdup=info"
+        };
+        let filter = EnvFilter::try_from_default_env()
+            .or_else(|_| EnvFilter::try_new(default_directive))
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_timer(timer)
+            .with_target(false)
+            .with_ansi(atty::is(Stream::Stderr))
+            .try_init();
     });
 }
 
@@ -171,6 +190,13 @@ enum ReportEvent {
         paths: Vec<PathBuf>,
         size: u64,
     },
+    AudioGroup {
+        hash: String,
+        paths: Vec<PathBuf>,
+        keep: PathBuf,
+        reason: String,
+        entries: Vec<serde_json::Value>,
+    },
     Summary {
         stats: Stats,
     },
@@ -200,6 +226,21 @@ fn start_report_writer(
                     "size": size,
                 })
                 .to_string(),
+                ReportEvent::AudioGroup {
+                    hash,
+                    paths,
+                    keep,
+                    reason,
+                    entries,
+                } => serde_json::json!({
+                    "type": "audio-group",
+                    "hash": hash,
+                    "paths": paths,
+                    "keep": keep,
+                    "reason": reason,
+                    "entries": entries,
+                })
+                .to_string(),
                 ReportEvent::Summary { stats } => serde_json::json!({
                     "type": "summary",
                     "stats": stats,
@@ -214,108 +255,52 @@ fn start_report_writer(
     Ok((tx, handle))
 }
 
-const ERROR_BUFFER_LIMIT: usize = 8;
-
-fn log_error(
-    err_sink: &Arc<Mutex<File>>,
-    err_buffer: &Arc<Mutex<VecDeque<String>>>,
-    err_count: &Arc<AtomicU64>,
-    msg: impl AsRef<str>,
-) {
-    let msg = msg.as_ref().to_string();
-    if let Ok(mut lock) = err_sink.lock() {
-        let _ = writeln!(lock, "{}", msg);
-    }
-    err_count.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut buf) = err_buffer.lock() {
-        if buf.len() >= ERROR_BUFFER_LIMIT {
-            buf.pop_front();
-        }
-        buf.push_back(msg);
-    }
-}
-
-fn file_mtime(path: &Path) -> Result<i64> {
-    let md = path.metadata()?;
-    let m = md.modified()?;
-    let dur = m.duration_since(UNIX_EPOCH).unwrap_or_default();
-    Ok(dur.as_secs() as i64)
+fn log_error(errors: &Arc<ErrorLog>, msg: impl AsRef<str>) {
+    errors.log("scan", msg);
 }
 
 fn collect_files(
     root: &Path,
-    err_sink: &Arc<Mutex<File>>,
-    err_buffer: &Arc<Mutex<VecDeque<String>>>,
-    err_count: &Arc<AtomicU64>,
+    errors: &Arc<ErrorLog>,
     scan_pb: Option<&ProgressBar>,
     scan_log: bool,
 ) -> Result<(Vec<FileRecord>, HashMap<PathBuf, (u64, i64)>)> {
+    let inventory = collect_inventory(
+        root,
+        0,
+        false,
+        |scanned, files_seen, last_display| {
+            if let Some(pb) = scan_pb {
+                pb.set_message(format!(
+                    "Scanning... entries: {} files: {} last: {}",
+                    scanned, files_seen, last_display
+                ));
+                pb.tick();
+            } else if scan_log {
+                print!(
+                    "\r\x1b[2KScanning... entries: {} files: {} last: {}",
+                    scanned, files_seen, last_display
+                );
+                let _ = std::io::stdout().flush();
+            }
+        },
+        |msg| log_error(errors, msg),
+    );
+
     let mut files = Vec::new();
     let mut map = HashMap::new();
-    let mut scanned = 0u64;
-    let mut last_path = String::new();
-    for entry in WalkDir::new(root).into_iter() {
-        scanned += 1;
-        if let Some(pb) = scan_pb {
-            let last_display = if last_path.is_empty() {
-                "<n/a>"
-            } else {
-                last_path.as_str()
-            };
-            pb.set_message(format!(
-                "Scanning... entries: {} files: {} last: {}",
-                scanned,
-                files.len(),
-                last_display
-            ));
-            pb.tick();
-        } else if scan_log {
-            let last_display = if last_path.is_empty() {
-                "<n/a>"
-            } else {
-                last_path.as_str()
-            };
-            print!(
-                "\r\x1b[2KScanning... entries: {} files: {} last: {}",
-                scanned,
-                files.len(),
-                last_display
-            );
-            let _ = std::io::stdout().flush();
+    for entry in inventory {
+        if entry.kind != InventoryEntryKind::File {
+            continue;
         }
-        match entry {
-            Ok(e) => {
-                last_path = e.path().to_string_lossy().to_string();
-                if e.file_type().is_file() {
-                    match e.metadata() {
-                        Ok(md) => {
-                            let size = md.len();
-                            let mtime = md
-                                .modified()
-                                .ok()
-                                .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs() as i64)
-                                .unwrap_or(0);
-                            let path = e.into_path();
-                            map.insert(path.clone(), (size, mtime));
-                            files.push(FileRecord { path, size, mtime });
-                        }
-                        Err(err) => log_error(
-                            err_sink,
-                            err_buffer,
-                            err_count,
-                            format!("metadata error: {}", err),
-                        ),
-                    }
-                }
-            }
-            Err(err) => log_error(
-                err_sink,
-                err_buffer,
-                err_count,
-                format!("walk error: {}", err),
-            ),
-        }
+        let size = entry.size.unwrap_or(0);
+        let mtime = entry.mtime.unwrap_or(0);
+        map.insert(entry.abs_path.clone(), (size, mtime));
+        files.push(FileRecord {
+            path: entry.abs_path,
+            size,
+            mtime,
+        });
     }
     if let Some(pb) = scan_pb {
         pb.set_message(format!("Scanning files ({} found)", files.len()));
@@ -324,38 +309,6 @@ fn collect_files(
         println!();
     }
     Ok((files, map))
-}
-
-fn hash_prefix(path: &Path, limit: usize, buffer_size: usize) -> Result<String> {
-    let file =
-        File::open(path).with_context(|| format!("failed opening file {}", path.display()))?;
-    let mut reader = BufReader::with_capacity(buffer_size, file).take(limit as u64);
-    let mut buf = vec![0u8; buffer_size];
-    let mut hasher = Hasher::new();
-    loop {
-        let read = reader.read(&mut buf)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-    }
-    Ok(hasher.finalize().to_hex().to_string())
-}
-
-fn hash_full(path: &Path, buffer_size: usize) -> Result<String> {
-    let file =
-        File::open(path).with_context(|| format!("failed opening file {}", path.display()))?;
-    let mut reader = BufReader::with_capacity(buffer_size, file);
-    let mut buf = vec![0u8; buffer_size];
-    let mut hasher = Hasher::new();
-    loop {
-        let read = reader.read(&mut buf)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-    }
-    Ok(hasher.finalize().to_hex().to_string())
 }
 
 type PartialOutput = (Option<String>, Option<(u64, Option<String>)>, PathBuf);
@@ -370,9 +323,7 @@ struct PartialContext {
     partial_bytes_read: Arc<AtomicU64>,
     files_processed: Arc<AtomicU64>,
     partial_done: Arc<AtomicU64>,
-    err_sink: Arc<Mutex<File>>,
-    err_buffer: Arc<Mutex<VecDeque<String>>>,
-    err_count: Arc<AtomicU64>,
+    errors: Arc<ErrorLog>,
     pb_partial: Option<ProgressBar>,
     report_tx: Option<mpsc::Sender<ReportEvent>>,
     dup_entries: Arc<Mutex<Vec<DupEntry>>>,
@@ -471,9 +422,7 @@ fn process_partial_candidate(rec: &FileRecord, ctx: &PartialContext) -> Option<P
         }
         Err(err) => {
             log_error(
-                &ctx.err_sink,
-                &ctx.err_buffer,
-                &ctx.err_count,
+                &ctx.errors,
                 format!("partial hash failed {}: {}", rec.path.display(), err),
             );
             ctx.partial_done.fetch_add(1, Ordering::Relaxed);
@@ -487,19 +436,15 @@ fn process_partial_candidate(rec: &FileRecord, ctx: &PartialContext) -> Option<P
 
 fn progress_bar(len: u64, label: &str) -> ProgressBar {
     let pb = ProgressBar::new(len);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{prefix:10} {wide_bar} {pos}/{len} [{elapsed_precise} -> {eta_precise}]",
-        )
-        .unwrap()
-        .progress_chars("█▉▊▋▌▍▎▏  "),
-    );
+    let style = match ProgressStyle::with_template(
+        "{prefix:10} {wide_bar} {pos}/{len} {msg} [{elapsed_precise} -> {eta_precise}]",
+    ) {
+        Ok(style) => style.progress_chars("█▉▊▋▌▍▎▏  "),
+        Err(_) => ProgressStyle::default_bar(),
+    };
+    pb.set_style(style);
     pb.set_prefix(label.to_string());
     pb
-}
-
-fn default_cache_path(root: &Path) -> PathBuf {
-    root.join(".dupdup-cache.sqlite")
 }
 
 fn open_cache(path: &Path) -> Result<Connection> {
@@ -545,11 +490,28 @@ fn load_cache(conn: &Connection) -> Result<HashMap<PathBuf, CacheEntry>> {
 }
 
 pub fn run(mut cfg: Config) -> Result<Stats> {
-    init_logging(cfg.dump_disk_info);
+    let use_tui = if cfg.mode == RunMode::Diagnostic || cfg.no_tui {
+        false
+    } else if cfg.tui {
+        true
+    } else {
+        atty::is(Stream::Stdout)
+    };
+    init_tracing(&cfg.mode, cfg.dump_disk_info, use_tui);
     if cfg.dump_disk_info {
         dump_detection(&cfg.path);
         return Ok(Stats::default());
     }
+    if cfg.resume && cfg.cache.is_none() {
+        bail!("--resume requires --cache <PATH>");
+    }
+    info!(
+        path = %cfg.path.display(),
+        output = %cfg.output.display(),
+        mode = ?cfg.mode,
+        preset = ?cfg.preset,
+        "starting dupdup run"
+    );
 
     let disk = disk_info(&cfg.path);
     let auto_preset = cfg.preset == Preset::Auto;
@@ -558,14 +520,17 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
         match disk.as_ref().and_then(|d| d.rotational) {
             Some(true) => {
                 println!("Auto-preset: detected rotational disk -> enabling --preset hdd");
+                info!("auto preset selected hdd");
                 preset = Preset::Hdd;
             }
             Some(false) => {
                 println!("Auto-preset: detected SSD -> enabling --preset ssd");
+                info!("auto preset selected ssd");
                 preset = Preset::Ssd;
             }
             None => {
                 println!("Auto-preset: could not detect disk type, defaulting to hdd");
+                warn!("disk type detection failed, defaulting to hdd preset");
                 preset = Preset::Hdd;
             }
         }
@@ -615,11 +580,12 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
         .error
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("error-{}.log", stamp)));
-    let err_sink = Arc::new(Mutex::new(File::create(&error_path)?));
+    let errors = Arc::new(ErrorLog::new(&error_path)?);
     let (report_tx, report_handle) = start_report_writer(&cfg.output)?;
-    let err_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(ERROR_BUFFER_LIMIT)));
-    let err_count = Arc::new(AtomicU64::new(0));
+    let err_buffer = errors.recent_messages();
+    let err_count = errors.count_handle();
     let thread_paths = Arc::new(Mutex::new(Vec::new()));
+    let scan_phase = Arc::new(AtomicU64::new(0));
     let status_line = Arc::new(Mutex::new(String::new()));
     let dup_entries = Arc::new(Mutex::new(Vec::new()));
     let dup_update_count = Arc::new(AtomicU64::new(0));
@@ -644,16 +610,14 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
         }
     }
 
-    let use_tui = if cfg.no_tui {
-        false
-    } else if cfg.tui {
-        true
-    } else {
-        atty::is(Stream::Stdout)
-    };
-    let auto_serve = !cfg.serve && !cfg.no_open_ui;
+    let should_serve = matches!(cfg.mode, RunMode::Ui | RunMode::Serve);
+    let should_open_ui = cfg.mode == RunMode::Ui;
     let mut server_handle: Option<std::thread::JoinHandle<()>> = None;
-    if cfg.serve || auto_serve {
+    info!(
+        use_tui,
+        should_serve, should_open_ui, "resolved runtime mode"
+    );
+    if should_serve {
         server_handle = serve_http(cfg.output.clone(), cfg.port);
         if server_handle.is_some() {
             let ui_url = best_ui_url(cfg.port);
@@ -664,20 +628,20 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
                     *status = format!("{} | UI: {}", status, ui_url);
                 }
             }
-            if !cfg.no_open_ui {
+            if should_open_ui {
                 open_http_ui(&ui_url);
             }
             println!("UI: {}", ui_url);
             println!("HTTP server running. Press Ctrl+C to stop.");
         }
     }
-    let scan_pb = if atty::is(Stream::Stdout) {
+    let scan_pb = if cfg.mode != RunMode::Diagnostic && atty::is(Stream::Stdout) {
         let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::with_template("{spinner} {msg}")
-                .unwrap()
-                .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
-        );
+        let style = match ProgressStyle::with_template("{spinner} {msg}") {
+            Ok(style) => style.tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
+            Err(_) => ProgressStyle::default_spinner(),
+        };
+        pb.set_style(style);
         pb.set_message("Scanning files...");
         pb.enable_steady_tick(Duration::from_millis(120));
         Some(pb)
@@ -686,19 +650,27 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
     };
 
     let scan_log = !atty::is(Stream::Stdout);
-    let (mut files, size_map) = collect_files(
-        &cfg.path,
-        &err_sink,
-        &err_buffer,
-        &err_count,
-        scan_pb.as_ref(),
-        scan_log,
-    )?;
+    let (mut files, size_map) = collect_files(&cfg.path, &errors, scan_pb.as_ref(), scan_log)?;
     if cfg.ordered {
         files.sort_by(|a, b| a.path.cmp(&b.path));
     }
     let total_files = files.len();
     println!("Discovered {} files", total_files);
+    info!(total_files, "file discovery complete");
+    let audio_candidates: Vec<(PathBuf, u64)> = files
+        .iter()
+        .filter_map(|rec| {
+            if lofty::file::FileType::from_path(&rec.path).is_some() {
+                Some((rec.path.clone(), rec.size))
+            } else {
+                None
+            }
+        })
+        .collect();
+    info!(
+        audio_candidates = audio_candidates.len(),
+        "audio candidate collection complete"
+    );
 
     let mut by_size: HashMap<u64, Vec<FileRecord>> = HashMap::new();
     for rec in &files {
@@ -759,6 +731,8 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
         candidates.sort_by(|a, b| a.path.cmp(&b.path));
     }
     let total_candidates = candidates.len();
+    info!(total_candidates, "size-group candidate selection complete");
+    scan_phase.store(1, Ordering::Relaxed);
 
     let thread_count = if cfg.ordered {
         1
@@ -774,15 +748,10 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
         .num_threads(thread_count)
         .build()?;
 
-    // Cache setup
-    let cache_path = cfg
-        .cache
-        .clone()
-        .unwrap_or_else(|| default_cache_path(&cfg.path));
-    let auto_cache = preset == Preset::Hdd;
-    let use_cache = cfg.resume || cfg.cache.is_some() || auto_cache;
-    let mut cache_conn = if use_cache {
-        Some(open_cache(&cache_path)?)
+    // Caching is only enabled when the user provides an explicit cache path.
+    let cache_path = cfg.cache.clone();
+    let mut cache_conn = if let Some(path) = cache_path.as_ref() {
+        Some(open_cache(path)?)
     } else {
         None
     };
@@ -802,6 +771,10 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
     let files_processed = Arc::new(AtomicU64::new(0));
     let partial_done = Arc::new(AtomicU64::new(0));
     let full_done = Arc::new(AtomicU64::new(0));
+    let audio_metadata_total = Arc::new(AtomicU64::new(0));
+    let audio_metadata_done = Arc::new(AtomicU64::new(0));
+    let audio_fingerprint_total = Arc::new(AtomicU64::new(0));
+    let audio_fingerprint_done = Arc::new(AtomicU64::new(0));
     let finished = Arc::new(AtomicBool::new(false));
     let aborting_flag = Arc::new(AtomicBool::new(false));
     let last_path = Arc::new(Mutex::new(String::from("starting...")));
@@ -811,15 +784,9 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
         Preset::Ssd => "ssd",
         Preset::Hdd => "hdd",
     };
-    let cache_status = if use_cache {
-        let mode = if cfg.resume || cfg.cache.is_some() {
-            "on"
-        } else if auto_cache {
-            "auto"
-        } else {
-            "on"
-        };
-        format!("{} ({})", mode, cache_path.display())
+    let cache_status = if let Some(path) = cache_path.as_ref() {
+        let mode = if cfg.resume { "resume" } else { "on" };
+        format!("{} ({})", mode, path.display())
     } else {
         "off".to_string()
     };
@@ -839,6 +806,7 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
         partial_status,
         cache_status
     );
+    info!(settings = %settings_line, "effective settings");
 
     // Ctrl+C: first press sets aborting flag, second exits immediately.
     {
@@ -863,10 +831,16 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
     let live_stats = LiveStats {
         total_files,
         total_candidates,
+        partial_enabled: cfg.partial_bytes > 0,
         partial_total: total_candidates as u64,
         full_total: Arc::new(AtomicU64::new(0)),
         partial_done: partial_done.clone(),
         full_done: full_done.clone(),
+        audio_metadata_total: audio_metadata_total.clone(),
+        audio_metadata_done: audio_metadata_done.clone(),
+        audio_fingerprint_total: audio_fingerprint_total.clone(),
+        audio_fingerprint_done: audio_fingerprint_done.clone(),
+        scan_phase: scan_phase.clone(),
         partial_bytes: partial_bytes_read.clone(),
         full_bytes: full_bytes_read.clone(),
         files_done: files_processed.clone(),
@@ -885,17 +859,31 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
         dup_selected: dup_selected.clone(),
         dup_expanded: dup_expanded.clone(),
         full_groups: full_groups.clone(),
-        start,
     };
-    let mp = if use_tui {
+    let mp = if use_tui || cfg.mode == RunMode::Diagnostic {
         None
     } else {
         Some(Arc::new(MultiProgress::new()))
     };
+    let candidate_label = if cfg.partial_bytes > 0 {
+        "cand-hash"
+    } else {
+        "select"
+    };
+    let exact_label = if cfg.partial_bytes > 0 {
+        "exact"
+    } else {
+        "hash"
+    };
     let pb_partial = mp
         .as_ref()
-        .map(|m| m.add(progress_bar(total_candidates as u64, "partial")));
-    let pb_full = mp.as_ref().map(|m| m.add(progress_bar(0, "full")));
+        .map(|m| m.add(progress_bar(total_candidates as u64, candidate_label)));
+    let pb_full = mp.as_ref().map(|m| m.add(progress_bar(0, exact_label)));
+    let pb_audio = mp.as_ref().map(|m| {
+        let pb = m.add(progress_bar(audio_candidates.len() as u64, "audio"));
+        pb.set_message("probe");
+        pb
+    });
     let tui_handle = if use_tui {
         start_tui(live_stats.clone())
     } else {
@@ -915,9 +903,7 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
         partial_bytes_read: partial_bytes_read.clone(),
         files_processed: files_processed.clone(),
         partial_done: partial_done.clone(),
-        err_sink: err_sink.clone(),
-        err_buffer: err_buffer.clone(),
-        err_count: err_count.clone(),
+        errors: errors.clone(),
         pb_partial: pb_partial.clone(),
         report_tx: Some(report_tx.clone()),
         dup_entries: dup_entries.clone(),
@@ -1060,7 +1046,7 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
         .store(full_candidates.len() as u64, Ordering::Relaxed);
 
     let cache_map_arc_full = cache_map_arc.clone();
-    let err_clone = err_sink.clone();
+    let errors_full = errors.clone();
     let thread_paths_full = thread_paths.clone();
     let last_path_full = last_path.clone();
     let report_tx_full = Some(report_tx.clone());
@@ -1078,7 +1064,7 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
             }
             update_current_path(&thread_paths_full, &last_path_full, path);
             if let Some(entry) = cache_map_arc_full.get(path) {
-                let meta_ok = file_mtime(path)
+                let meta_ok = file_mtime_secs(path)
                     .ok()
                     .map(|m| m == entry.mtime)
                     .unwrap_or(false)
@@ -1131,9 +1117,7 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
                 }
                 Err(err) => {
                     log_error(
-                        &err_clone,
-                        &err_buffer,
-                        &err_count,
+                        &errors_full,
                         format!("full hash failed {}: {}", path.display(), err),
                     );
                     if let Some(pb) = pb_full.as_ref() {
@@ -1153,7 +1137,7 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
                     }
                     update_current_path(&thread_paths_full, &last_path_full, path);
                     if let Some(entry) = cache_map_arc_full.get(path) {
-                        let meta_ok = file_mtime(path)
+                        let meta_ok = file_mtime_secs(path)
                             .ok()
                             .map(|m| m == entry.mtime)
                             .unwrap_or(false)
@@ -1209,9 +1193,7 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
                         }
                         Err(err) => {
                             log_error(
-                                &err_clone,
-                                &err_buffer,
-                                &err_count,
+                                &errors_full,
                                 format!("full hash failed {}: {}", path.display(), err),
                             );
                             if let Some(pb) = pb_full.as_ref() {
@@ -1224,9 +1206,11 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
                 .collect::<Vec<_>>()
         })
     };
+    scan_phase.store(2, Ordering::Relaxed);
     if let Some(pb) = pb_full.as_ref() {
         pb.finish_and_clear();
     }
+    info!(full_hashed = full_output.len(), "full hash stage complete");
 
     for (full_hash, path, _maybe_partial) in full_output {
         full_pairs.push((full_hash, path));
@@ -1258,6 +1242,10 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
     if let Ok(mut w) = potential_waste.lock() {
         *w = wasted_bytes;
     }
+    info!(
+        duplicate_sets = filtered.len(),
+        duplicate_files, wasted_bytes, "exact duplicate grouping complete"
+    );
     dup_stage.store(0, Ordering::Relaxed);
     {
         let mut snapshot: Vec<DupEntry> = filtered
@@ -1290,6 +1278,215 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
             paths: paths.clone(),
             size: *size,
         });
+    }
+
+    if !audio_candidates.is_empty() {
+        scan_phase.store(3, Ordering::Relaxed);
+        let msg = format!("Analyzing {} audio files...", audio_candidates.len());
+        info!(
+            audio_candidates = audio_candidates.len(),
+            "starting audio duplicate analysis"
+        );
+        if use_tui {
+            if let Ok(mut status) = status_line.lock() {
+                *status = msg.clone();
+            }
+        } else {
+            println!("{}", msg);
+        }
+
+        let audio_progress = AudioAnalysisProgress::new(audio_candidates.len());
+        let audio_progress_reporter = {
+            let progress = audio_progress.clone();
+            let status_line = status_line.clone();
+            let pb_audio = pb_audio.clone();
+            let audio_metadata_total = audio_metadata_total.clone();
+            let audio_metadata_done = audio_metadata_done.clone();
+            let audio_fingerprint_total = audio_fingerprint_total.clone();
+            let audio_fingerprint_done = audio_fingerprint_done.clone();
+            let diagnostic_mode = cfg.mode == RunMode::Diagnostic;
+            std::thread::spawn(move || {
+                let mut last_probe = u64::MAX;
+                let mut last_fingerprint = u64::MAX;
+                loop {
+                    let probe_done = progress.metadata_done();
+                    let probe_total = progress.metadata_total();
+                    let fingerprint_done = progress.fingerprint_done();
+                    let fingerprint_total = progress.fingerprint_total();
+                    audio_metadata_total.store(probe_total, Ordering::Relaxed);
+                    audio_metadata_done.store(probe_done, Ordering::Relaxed);
+                    audio_fingerprint_total.store(fingerprint_total, Ordering::Relaxed);
+                    audio_fingerprint_done.store(fingerprint_done, Ordering::Relaxed);
+                    let phase = if fingerprint_total == 0 {
+                        "probe"
+                    } else {
+                        "fingerprint"
+                    };
+                    let status = if fingerprint_total == 0 {
+                        format!("Audio analysis: probe {}/{}", probe_done, probe_total)
+                    } else {
+                        format!(
+                            "Audio analysis: probe {}/{} | fingerprint {}/{}",
+                            probe_done, probe_total, fingerprint_done, fingerprint_total
+                        )
+                    };
+                    if let Ok(mut lock) = status_line.lock() {
+                        *lock = status.clone();
+                    }
+                    if let Some(pb) = pb_audio.as_ref() {
+                        if fingerprint_total == 0 {
+                            pb.set_length(probe_total.max(1));
+                            pb.set_position(probe_done.min(probe_total));
+                        } else {
+                            pb.set_length(fingerprint_total.max(1));
+                            pb.set_position(fingerprint_done.min(fingerprint_total));
+                        }
+                        pb.set_message(phase.to_string());
+                    }
+                    if diagnostic_mode
+                        && (probe_done != last_probe || fingerprint_done != last_fingerprint)
+                    {
+                        info!(
+                            probe_done,
+                            probe_total,
+                            fingerprint_done,
+                            fingerprint_total,
+                            "audio analysis progress"
+                        );
+                        last_probe = probe_done;
+                        last_fingerprint = fingerprint_done;
+                    }
+                    if progress.is_finished() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            })
+        };
+
+        let (audio_groups, audio_errors) = pool.install(|| {
+            analyze_audio_duplicates(
+                &audio_candidates,
+                Some(audio_progress.clone()),
+                Some(thread_paths.clone()),
+                Some(last_path.clone()),
+            )
+        });
+        audio_progress.finish();
+        let _ = audio_progress_reporter.join();
+        if let Some(pb) = pb_audio.as_ref() {
+            pb.finish_and_clear();
+        }
+        info!(
+            audio_groups = audio_groups.len(),
+            audio_errors = audio_errors.len(),
+            "audio duplicate analysis complete"
+        );
+        for err in audio_errors {
+            log_error(&errors, err);
+        }
+        if !audio_groups.is_empty() {
+            let mut snapshot: Vec<DupEntry> = audio_groups
+                .iter()
+                .map(|group| {
+                    let mut paths = Vec::new();
+                    for entry in &group.entries {
+                        let mut parts = vec![entry.path.to_string_lossy().to_string()];
+                        let mut meta = Vec::new();
+                        meta.push(entry.codec.clone());
+                        if entry.lossless {
+                            meta.push("lossless".to_string());
+                        }
+                        if let Some(bit_depth) = entry.bit_depth {
+                            meta.push(format!("{}-bit", bit_depth));
+                        }
+                        if let Some(sample_rate) = entry.sample_rate {
+                            meta.push(format!("{:.1} kHz", sample_rate as f64 / 1000.0));
+                        }
+                        if let Some(bitrate) = entry.bitrate_kbps {
+                            meta.push(format!("{} kbps", bitrate));
+                        }
+                        if !meta.is_empty() {
+                            parts.push(format!("({})", meta.join(", ")));
+                        }
+                        let prefix = if entry.path == group.recommendation.keep {
+                            "KEEP"
+                        } else {
+                            "DROP"
+                        };
+                        paths.push(format!("{} {}", prefix, parts.join(" ")));
+                    }
+                    let gain = group
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.path != group.recommendation.keep)
+                        .map(|entry| entry.size as u128)
+                        .sum();
+                    let keep_size = group
+                        .entries
+                        .iter()
+                        .find(|entry| entry.path == group.recommendation.keep)
+                        .map(|entry| entry.size)
+                        .unwrap_or(0);
+                    DupEntry {
+                        hash: group.id.clone(),
+                        gain,
+                        count: group.entries.len(),
+                        size: keep_size,
+                        paths,
+                    }
+                })
+                .collect();
+            snapshot.sort_by(|a, b| b.gain.cmp(&a.gain));
+            snapshot.truncate(200);
+            if let Ok(mut lock) = dup_entries.lock() {
+                *lock = snapshot;
+            }
+            dup_stage.store(3, Ordering::Relaxed);
+            let msg = format!(
+                "Audio pass: {} groups with keep-best recommendations",
+                audio_groups.len()
+            );
+            if use_tui {
+                if let Ok(mut status) = status_line.lock() {
+                    *status = msg.clone();
+                }
+            } else {
+                println!("{}", msg);
+            }
+        }
+        for group in audio_groups {
+            let entries = group
+                .entries
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "path": entry.path,
+                        "size": entry.size,
+                        "codec": entry.codec,
+                        "duration_ms": entry.duration_ms,
+                        "sample_rate": entry.sample_rate,
+                        "bit_depth": entry.bit_depth,
+                        "channels": entry.channels,
+                        "bitrate_kbps": entry.bitrate_kbps,
+                        "lossless": entry.lossless,
+                        "recommended_keep": entry.path == group.recommendation.keep,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let paths = group
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>();
+            let _ = report_tx.send(ReportEvent::AudioGroup {
+                hash: group.id,
+                paths,
+                keep: group.recommendation.keep,
+                reason: group.recommendation.reason,
+                entries,
+            });
+        }
     }
 
     // Persist cache updates
@@ -1339,14 +1536,14 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
     };
     finished.store(true, Ordering::Relaxed);
 
-    println!(
+    let done_line = format!(
         "Done in {:.2}s. Duplicate sets: {} ({} files), reclaimable ~{} bytes",
         duration_seconds,
         filtered.len(),
         duplicate_files,
         wasted_bytes
     );
-    println!(
+    let hash_line = format!(
         "Hashed: {:.2} MiB ({:.2} MiB/s), files: {} ({:.1}/s)",
         total_bytes_hashed as f64 / (1024.0 * 1024.0),
         bytes_per_sec / (1024.0 * 1024.0),
@@ -1357,6 +1554,8 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
     if let Some(handle) = tui_handle {
         let _ = handle.join();
     }
+    println!("{}", done_line);
+    println!("{}", hash_line);
 
     if aborting_flag.load(Ordering::SeqCst) {
         std::process::exit(130);
@@ -1371,6 +1570,13 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
         duration_seconds,
         error_log: Some(error_path),
     };
+    info!(
+        duration_seconds = stats.duration_seconds,
+        duplicate_sets = stats.duplicate_sets,
+        duplicate_files = stats.duplicate_files,
+        wasted_bytes = stats.wasted_bytes,
+        "run complete"
+    );
     let _ = report_tx.send(ReportEvent::Summary {
         stats: stats.clone(),
     });

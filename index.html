@@ -137,6 +137,19 @@ let streamLastDataAt = 0;
 let streamFileRecords = 0;
 let streamGroupRecords = 0;
 
+function makeGroup(hash, size) {
+  return {
+    hash,
+    paths: [],
+    size: size ?? null,
+    keepSet: new Set(),
+    pathSet: new Set(),
+    pathSizes: new Map(),
+    reason: null,
+    audioEntries: [],
+  };
+}
+
 function resetData() {
   groups = [];
   filtered = [];
@@ -147,7 +160,7 @@ function resetData() {
 function ensureGroup(hash, size) {
   let g = groupIndex.get(hash);
   if (!g) {
-    g = {hash, paths: [], size: size ?? null, keepSet: new Set(), pathSet: new Set()};
+    g = makeGroup(hash, size);
     groupIndex.set(hash, g);
     groups.push(g);
   }
@@ -177,6 +190,17 @@ function ingestGroupRecord(obj) {
     g.keepSet = new Set();
   }
   if (obj.size != null) g.size = obj.size;
+  if (Array.isArray(obj.entries)) {
+    g.audioEntries = obj.entries.slice();
+    g.pathSizes = new Map();
+    obj.entries.forEach((entry, idx) => {
+      if (entry && entry.path) {
+        if (entry.size != null) g.pathSizes.set(entry.path, entry.size);
+        if (entry.recommended_keep) g.keepSet.add(idx);
+      }
+    });
+  }
+  if (obj.reason) g.reason = obj.reason;
   return true;
 }
 
@@ -202,9 +226,15 @@ function normalize(data) {
   if (typeof data === 'object') {
     for (const [hash, val] of Object.entries(data)) {
       if (Array.isArray(val)) {
-        out.push({hash, paths: val, size: null, keepSet: new Set(), pathSet: new Set(val)});
+        const group = makeGroup(hash, null);
+        group.paths = val;
+        group.pathSet = new Set(val);
+        out.push(group);
       } else if (val && val.paths) {
-        out.push({hash, paths: val.paths, size: val.size ?? null, keepSet: new Set(), pathSet: new Set(val.paths)});
+        const group = makeGroup(hash, val.size ?? null);
+        group.paths = val.paths;
+        group.pathSet = new Set(val.paths);
+        out.push(group);
       }
     }
   }
@@ -224,7 +254,7 @@ async function loadFromUrl(url) {
     const ensure = (hash, size) => {
       let g = idx.get(hash);
       if (!g) {
-        g = {hash, paths: [], size: size ?? null, keepSet: new Set(), pathSet: new Set()};
+        g = makeGroup(hash, size);
         idx.set(hash, g);
         arr.push(g);
       }
@@ -241,10 +271,9 @@ async function loadFromUrl(url) {
           g.pathSet.add(obj.path);
           g.paths.push(obj.path);
         }
-      } else if (obj && (obj.type === 'group' || (obj.hash && obj.paths))) {
-        const g = ensure(obj.hash, obj.size ?? null);
-        g.paths = Array.isArray(obj.paths) ? obj.paths.slice() : [];
-        g.pathSet = new Set(g.paths);
+      } else if (obj && (obj.type === 'group' || obj.type === 'audio-group' || (obj.hash && obj.paths))) {
+        ensure(obj.hash, obj.size ?? null);
+        ingestGroupRecord(obj);
       } else {
         const [hash, val] = Object.entries(obj)[0];
         if (Array.isArray(val)) {
@@ -277,7 +306,7 @@ function processStreamText(text) {
       } else if (obj && (obj.type === 'file' || (obj.hash && obj.path))) {
         updated = ingestFileRecord(obj) || updated;
         streamFileRecords += 1;
-      } else if (obj && (obj.type === 'group' || (obj.hash && obj.paths))) {
+      } else if (obj && (obj.type === 'group' || obj.type === 'audio-group' || (obj.hash && obj.paths))) {
         updated = ingestGroupRecord(obj) || updated;
         streamGroupRecords += 1;
       } else {
@@ -344,9 +373,13 @@ function stopStreaming() {
 }
 
 function potentialWin(g) {
-  if (!g.size) return 0;
-  const delCount = g.keepSet && g.keepSet.size > 0 ? (g.paths.length - g.keepSet.size) : 0;
-  return g.size * delCount;
+  if (!(g.keepSet && g.keepSet.size > 0)) return 0;
+  return g.paths.reduce((acc, path, idx) => {
+    if (g.keepSet.has(idx)) return acc;
+    if (g.pathSizes && g.pathSizes.has(path)) return acc + (g.pathSizes.get(path) || 0);
+    if (g.size) return acc + g.size;
+    return acc;
+  }, 0);
 }
 
 function streamStatusText() {
@@ -382,9 +415,16 @@ function renderList() {
     header.className = 'group-header';
     const win = potentialWin(g);
     const winLabel = win ? `${formatBytes(win)} reclaim` : 'select to compute';
-    const sizeLabel = g.size ? formatBytes(g.size) : 'size unknown';
-    header.innerHTML = `<span>Group ${idx+1} • ${g.paths.length} files • ${sizeLabel} each</span><span>${winLabel}</span>`;
+    const sizeLabel = g.size ? `${formatBytes(g.size)} each` : 'variable size';
+    header.innerHTML = `<span>Group ${idx+1} • ${g.paths.length} files • ${sizeLabel}</span><span>${winLabel}</span>`;
     div.appendChild(header);
+    if (g.reason) {
+      const meta = document.createElement('div');
+      meta.className = 'group-header';
+      meta.style.marginTop = '6px';
+      meta.innerHTML = `<span>${g.reason}</span><span>${g.hash.startsWith('audio:') ? 'audio match' : ''}</span>`;
+      div.appendChild(meta);
+    }
     const paths = document.createElement('div');
     paths.className = 'paths';
     g.paths.forEach((p, i) => {
@@ -399,7 +439,19 @@ function renderList() {
         renderList();
       };
       const label = document.createElement('span');
-      label.textContent = p;
+      const entry = Array.isArray(g.audioEntries) ? g.audioEntries.find(item => item.path === p) : null;
+      const parts = [p];
+      if (entry) {
+        const tech = [];
+        if (entry.codec) tech.push(entry.codec);
+        if (entry.lossless) tech.push('lossless');
+        if (entry.bit_depth) tech.push(`${entry.bit_depth}-bit`);
+        if (entry.sample_rate) tech.push(`${(entry.sample_rate / 1000).toFixed(1)} kHz`);
+        if (entry.bitrate_kbps) tech.push(`${entry.bitrate_kbps} kbps`);
+        if (entry.size != null) tech.push(formatBytes(entry.size));
+        if (tech.length) parts.push(`(${tech.join(', ')})`);
+      }
+      label.textContent = parts.join(' ');
       const kept = g.keepSet?.has(i);
       label.className = kept ? 'keep' : 'delete';
       const pill = document.createElement('span');

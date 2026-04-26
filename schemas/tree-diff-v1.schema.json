@@ -1,0 +1,317 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/padenot/dupdup/blob/main/schemas/tree-diff-v1.schema.json",
+  "title": "dupdup tree diff report",
+  "description": "JSON Lines schema for dupdup diff output. Each line must validate against one variant in this schema.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "format",
+        "schema_id",
+        "root_a",
+        "root_b",
+        "partial_bytes",
+        "block_size"
+      ],
+      "properties": {
+        "type": {
+          "const": "meta"
+        },
+        "format": {
+          "const": "dupdup-tree-diff/v1"
+        },
+        "schema_id": {
+          "type": "string"
+        },
+        "root_a": {
+          "type": "string"
+        },
+        "root_b": {
+          "type": "string"
+        },
+        "partial_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "block_size": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "path",
+        "status",
+        "entry_type",
+        "type_a",
+        "type_b",
+        "size_a",
+        "size_b",
+        "mtime_a",
+        "mtime_b",
+        "link_target_a",
+        "link_target_b",
+        "comparison_basis",
+        "partial_hash_a",
+        "partial_hash_b",
+        "hash_a",
+        "hash_b",
+        "metadata_differences",
+        "note"
+      ],
+      "properties": {
+        "type": {
+          "const": "path-diff"
+        },
+        "path": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "only-in-a",
+            "only-in-b",
+            "same-path-same-content",
+            "same-path-different-content",
+            "same-path-different-metadata",
+            "type-mismatch",
+            "comparison-error"
+          ]
+        },
+        "entry_type": {
+          "$ref": "#/$defs/entryKindOrNull"
+        },
+        "type_a": {
+          "$ref": "#/$defs/entryKindOrNull"
+        },
+        "type_b": {
+          "$ref": "#/$defs/entryKindOrNull"
+        },
+        "size_a": {
+          "$ref": "#/$defs/u64OrNull"
+        },
+        "size_b": {
+          "$ref": "#/$defs/u64OrNull"
+        },
+        "mtime_a": {
+          "$ref": "#/$defs/i64OrNull"
+        },
+        "mtime_b": {
+          "$ref": "#/$defs/i64OrNull"
+        },
+        "link_target_a": {
+          "$ref": "#/$defs/stringOrNull"
+        },
+        "link_target_b": {
+          "$ref": "#/$defs/stringOrNull"
+        },
+        "comparison_basis": {
+          "$ref": "#/$defs/comparisonBasisOrNull"
+        },
+        "partial_hash_a": {
+          "$ref": "#/$defs/stringOrNull"
+        },
+        "partial_hash_b": {
+          "$ref": "#/$defs/stringOrNull"
+        },
+        "hash_a": {
+          "$ref": "#/$defs/stringOrNull"
+        },
+        "hash_b": {
+          "$ref": "#/$defs/stringOrNull"
+        },
+        "metadata_differences": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "note": {
+          "$ref": "#/$defs/stringOrNull"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "status",
+        "entry_type",
+        "content_hash",
+        "size",
+        "a_paths",
+        "b_paths",
+        "comparison_basis"
+      ],
+      "properties": {
+        "type": {
+          "const": "relocation"
+        },
+        "status": {
+          "const": "same-content-different-path"
+        },
+        "entry_type": {
+          "const": "file"
+        },
+        "content_hash": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "a_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "b_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "comparison_basis": {
+          "const": "full-hash"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "stats"
+      ],
+      "properties": {
+        "type": {
+          "const": "summary"
+        },
+        "stats": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "only_in_a",
+            "only_in_b",
+            "same_path_same_content",
+            "same_path_different_content",
+            "same_path_different_metadata",
+            "type_mismatch",
+            "relocation_groups",
+            "relocated_paths_a",
+            "relocated_paths_b",
+            "comparison_errors",
+            "duration_seconds",
+            "error_log"
+          ],
+          "properties": {
+            "only_in_a": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "only_in_b": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "same_path_same_content": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "same_path_different_content": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "same_path_different_metadata": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "type_mismatch": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "relocation_groups": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "relocated_paths_a": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "relocated_paths_b": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "comparison_errors": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "duration_seconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "error_log": {
+              "$ref": "#/$defs/stringOrNull"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "entryKindOrNull": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "file",
+        "directory",
+        "symlink",
+        "other",
+        null
+      ]
+    },
+    "comparisonBasisOrNull": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "size",
+        "partial-hash",
+        "full-hash",
+        "link-target",
+        "entry-type",
+        "read-error",
+        null
+      ]
+    },
+    "u64OrNull": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "i64OrNull": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "stringOrNull": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

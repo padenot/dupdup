@@ -1,4 +1,4 @@
-use clap::{ArgAction, Parser, ValueHint};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueHint};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -19,13 +19,18 @@ pub enum Preset {
     Hdd,
 }
 
-#[derive(Parser, Debug, Clone)]
-#[command(
-    name = "dupdup",
-    version,
-    about = "Find duplicate files with fast hashes"
-)]
-pub struct Config {
+#[derive(clap::ValueEnum, Clone, Default, Debug, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunMode {
+    #[default]
+    Ui,
+    Serve,
+    Headless,
+    Diagnostic,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ScanConfig {
     /// Path to analyze
     #[arg(value_hint = ValueHint::DirPath, default_value = ".")]
     pub path: PathBuf,
@@ -38,7 +43,7 @@ pub struct Config {
     #[arg(long, default_value = None)]
     pub error: Option<PathBuf>,
 
-    /// Bytes to read in the partial pass (set 0 to skip partial pass)
+    /// Bytes to read in the candidate-hash stage (set 0 to skip it)
     #[arg(long, default_value = "4096", value_parser = parse_byte_size)]
     pub partial_bytes: usize,
 
@@ -50,10 +55,12 @@ pub struct Config {
     #[arg(long, default_value_t = 0)]
     pub threads: usize,
 
-    /// Disable auto-opening the web UI
-    #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
-    pub no_open_ui: bool,
-    /// Enable terminal TUI (ratatui) during scan
+    /// Run mode: ui starts the HTTP UI and opens it, serve starts the HTTP UI without opening it,
+    /// headless disables the HTTP UI, diagnostic disables both HTTP UI and TUI and enables tracing.
+    #[arg(long, default_value_t, value_enum)]
+    pub mode: RunMode,
+
+    /// Force-enable the terminal TUI during the scan
     #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
     pub tui: bool,
 
@@ -61,7 +68,7 @@ pub struct Config {
     #[arg(long)]
     pub cache: Option<PathBuf>,
 
-    /// Reuse cached hashes when available
+    /// Reuse cached hashes from --cache
     #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
     pub resume: bool,
 
@@ -73,19 +80,68 @@ pub struct Config {
     #[clap(short, long, default_value_t, value_enum)]
     pub preset: Preset,
 
-    /// Dump hard drive detection info and exit (for diagnostics)
+    /// Dump hard drive detection info and exit
     #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
     pub dump_disk_info: bool,
-
-    /// Serve a tiny HTTP UI (index.html + report)
-    #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
-    pub serve: bool,
 
     /// Port for the HTTP UI
     #[arg(long, default_value_t = 3030)]
     pub port: u16,
 
-    /// Disable terminal TUI (ratatui) during scan
+    /// Disable the terminal TUI during the scan
     #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
     pub no_tui: bool,
 }
+
+#[derive(Args, Debug, Clone)]
+pub struct DiffConfig {
+    /// Left-hand directory tree
+    #[arg(value_hint = ValueHint::DirPath)]
+    pub a: PathBuf,
+
+    /// Right-hand directory tree
+    #[arg(value_hint = ValueHint::DirPath)]
+    pub b: PathBuf,
+
+    /// Output file (JSON Lines)
+    #[arg(short, long, default_value = "tree-diff.jsonl")]
+    pub output: PathBuf,
+
+    /// Error log file
+    #[arg(long, default_value = None)]
+    pub error: Option<PathBuf>,
+
+    /// Bytes to read in the candidate-hash stage (set 0 to go directly to full hashes)
+    #[arg(long, default_value = "4096", value_parser = parse_byte_size)]
+    pub partial_bytes: usize,
+
+    /// Block size used when hashing files
+    #[arg(long, default_value = "1M", value_parser = parse_byte_size)]
+    pub block_size: usize,
+
+    /// Number of worker threads (0 = num_cpus)
+    #[arg(long, default_value_t = 0)]
+    pub threads: usize,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Diff two directory trees and emit a structured JSONL report
+    Diff(DiffConfig),
+}
+
+#[derive(Parser, Debug, Clone)]
+#[command(
+    name = "dupdup",
+    version,
+    about = "Find duplicate files, audio-equivalent tracks, and diff similar directory trees"
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
+    #[command(flatten)]
+    pub scan: ScanConfig,
+}
+
+pub type Config = ScanConfig;
