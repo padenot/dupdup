@@ -22,7 +22,7 @@ Records:
 File comparison order:
 1. entry type
 2. file size
-3. partial hash if `--partial-bytes > 0`
+3. partial hash
 4. full hash
 
 Guarantees:

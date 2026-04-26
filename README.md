@@ -26,8 +26,8 @@ Modes:
 ./target/release/dupdup diff /path/to/A /path/to/B --output tree-diff.jsonl
 ```
 
-`dupdup diff` compares by path and type, then size, then partial hash when
-enabled, then full hash before claiming equal content.
+`dupdup diff` compares by path and type, then size, then partial hash, then
+full hash before claiming equal content.
 
 ## Output
 - duplicate scan: JSONL `group` records

@@ -402,13 +402,6 @@ fn process_partial_candidate(rec: &FileRecord, ctx: &PartialContext) -> Option<P
             ));
         }
     }
-    if ctx.partial_bytes == 0 {
-        if let Some(pb) = &ctx.pb_partial {
-            pb.inc(1);
-        }
-        ctx.partial_done.fetch_add(1, Ordering::Relaxed);
-        return Some((None, Some((rec.size, None)), rec.path.clone()));
-    }
     match hash_prefix(&rec.path, ctx.partial_bytes, ctx.block_size) {
         Ok(h) => {
             let read = std::cmp::min(rec.size as usize, ctx.partial_bytes) as u64;
@@ -542,7 +535,6 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
             cfg.threads = num_cpus::get().saturating_mul(2);
         }
         cfg.block_size = cfg.block_size.max(1 * 1024 * 1024);
-        cfg.partial_bytes = 0; // full-pass hashing
     }
     if preset == Preset::Hdd {
         // Favor sequential I/O on spinny disks: single thread unless user insisted on 1+.
@@ -553,9 +545,6 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
         }
         cfg.ordered = true;
         cfg.block_size = cfg.block_size.min(128 * 1024).max(64 * 1024);
-        if cfg.partial_bytes == 0 {
-            cfg.partial_bytes = 4096;
-        }
     }
 
     // Align block size to filesystem block for better throughput/cache fit
@@ -790,11 +779,7 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
     } else {
         "off".to_string()
     };
-    let partial_status = if cfg.partial_bytes == 0 {
-        "partial: off (full hash)".to_string()
-    } else {
-        format!("partial: {}", format_bytes_binary(cfg.partial_bytes as u64))
-    };
+    let partial_status = format!("partial: {}", format_bytes_binary(cfg.partial_bytes as u64));
     let settings_line = format!(
         "preset:{} auto:{} ordered:{} threads:{} block:{} fs:{} {} cache:{}",
         preset_label,
@@ -831,7 +816,6 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
     let live_stats = LiveStats {
         total_files,
         total_candidates,
-        partial_enabled: cfg.partial_bytes > 0,
         partial_total: total_candidates as u64,
         full_total: Arc::new(AtomicU64::new(0)),
         partial_done: partial_done.clone(),
@@ -865,16 +849,8 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
     } else {
         Some(Arc::new(MultiProgress::new()))
     };
-    let candidate_label = if cfg.partial_bytes > 0 {
-        "cand-hash"
-    } else {
-        "select"
-    };
-    let exact_label = if cfg.partial_bytes > 0 {
-        "exact"
-    } else {
-        "hash"
-    };
+    let candidate_label = "cand-hash";
+    let exact_label = "exact";
     let pb_partial = mp
         .as_ref()
         .map(|m| m.add(progress_bar(total_candidates as u64, candidate_label)));
@@ -956,84 +932,65 @@ pub fn run(mut cfg: Config) -> Result<Stats> {
         .map(|v| v.len())
         .sum();
     // Estimate upper-bound savings from partial groups (or size groups if no partials)
-    let upper_waste: u128 = if partial_bytes == 0 {
-        by_size
-            .values()
-            .map(|v| {
-                if v.len() > 1 {
-                    v[0].size as u128 * (v.len() as u128 - 1)
-                } else {
-                    0
-                }
-            })
-            .sum()
-    } else {
-        partial_groups
-            .values()
-            .map(|v| {
-                if v.len() > 1 {
-                    let sz = size_lookup.get(&v[0]).map(|(s, _)| *s).unwrap_or(0) as u128;
-                    sz * (v.len() as u128 - 1)
-                } else {
-                    0
-                }
-            })
-            .sum()
-    };
+    let upper_waste: u128 = partial_groups
+        .values()
+        .map(|v| {
+            if v.len() > 1 {
+                let sz = size_lookup.get(&v[0]).map(|(s, _)| *s).unwrap_or(0) as u128;
+                sz * (v.len() as u128 - 1)
+            } else {
+                0
+            }
+        })
+        .sum();
     if let Ok(mut w) = potential_waste.lock() {
         *w = upper_waste;
     }
-    if partial_bytes != 0 {
-        let msg = format!(
-            "Partial pass: {} candidate sets, {} files, potential waste up to {}",
-            partial_dup_sets,
-            partial_dup_files,
-            format_bytes_binary_u128(upper_waste)
-        );
-        if use_tui {
-            if let Ok(mut status) = status_line.lock() {
-                *status = msg;
-            }
-        } else {
-            println!("{}", msg);
+    let msg = format!(
+        "Partial pass: {} candidate sets, {} files, potential waste up to {}",
+        partial_dup_sets,
+        partial_dup_files,
+        format_bytes_binary_u128(upper_waste)
+    );
+    if use_tui {
+        if let Ok(mut status) = status_line.lock() {
+            *status = msg;
         }
-        let mut snapshot: Vec<DupEntry> = partial_groups
-            .iter()
-            .filter(|(_, v)| v.len() > 1)
-            .map(|(key, v)| {
-                let size = size_lookup.get(&v[0]).map(|(s, _)| *s).unwrap_or(0);
-                let mut paths = Vec::new();
-                for p in v.iter().take(MAX_DUP_PATHS) {
-                    paths.push(p.to_string_lossy().to_string());
-                }
-                DupEntry {
-                    hash: format!("partial:{}:{}", key.0, key.1),
-                    gain: size as u128 * (v.len() as u128 - 1),
-                    count: v.len(),
-                    size,
-                    paths,
-                }
-            })
-            .collect();
-        snapshot.sort_by(|a, b| b.gain.cmp(&a.gain));
-        snapshot.truncate(200);
-        if !snapshot.is_empty() {
-            if let Ok(mut lock) = dup_entries.lock() {
-                *lock = snapshot;
+    } else {
+        println!("{}", msg);
+    }
+    let mut snapshot: Vec<DupEntry> = partial_groups
+        .iter()
+        .filter(|(_, v)| v.len() > 1)
+        .map(|(key, v)| {
+            let size = size_lookup.get(&v[0]).map(|(s, _)| *s).unwrap_or(0);
+            let mut paths = Vec::new();
+            for p in v.iter().take(MAX_DUP_PATHS) {
+                paths.push(p.to_string_lossy().to_string());
             }
-            dup_stage.store(1, Ordering::Relaxed);
+            DupEntry {
+                hash: format!("partial:{}:{}", key.0, key.1),
+                gain: size as u128 * (v.len() as u128 - 1),
+                count: v.len(),
+                size,
+                paths,
+            }
+        })
+        .collect();
+    snapshot.sort_by(|a, b| b.gain.cmp(&a.gain));
+    snapshot.truncate(200);
+    if !snapshot.is_empty() {
+        if let Ok(mut lock) = dup_entries.lock() {
+            *lock = snapshot;
         }
+        dup_stage.store(1, Ordering::Relaxed);
     }
 
-    let mut full_candidates: Vec<PathBuf> = if partial_bytes == 0 {
-        candidates.into_iter().map(|r| r.path).collect()
-    } else {
-        partial_groups
-            .iter()
-            .filter(|(_, v)| v.len() > 1)
-            .flat_map(|(_, v)| v.clone())
-            .collect()
-    };
+    let mut full_candidates: Vec<PathBuf> = partial_groups
+        .iter()
+        .filter(|(_, v)| v.len() > 1)
+        .flat_map(|(_, v)| v.clone())
+        .collect();
     if cfg.ordered {
         full_candidates.sort();
     }

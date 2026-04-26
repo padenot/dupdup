@@ -304,11 +304,9 @@ fn evaluate_same_path_candidate(
         ));
     }
 
-    let mut partial_a = None;
-    let mut partial_b = None;
-    if partial_bytes > 0 {
+    let partial_a =
         match cached_partial_hash(cache, &candidate.a.abs_path, partial_bytes, block_size) {
-            Ok(value) => partial_a = Some(value),
+            Ok(value) => Some(value),
             Err(err) => {
                 let msg = format!(
                     "partial hash failed for {}: {}",
@@ -337,9 +335,10 @@ fn evaluate_same_path_candidate(
                     Some(msg),
                 ));
             }
-        }
+        };
+    let partial_b =
         match cached_partial_hash(cache, &candidate.b.abs_path, partial_bytes, block_size) {
-            Ok(value) => partial_b = Some(value),
+            Ok(value) => Some(value),
             Err(err) => {
                 let msg = format!(
                     "partial hash failed for {}: {}",
@@ -368,29 +367,28 @@ fn evaluate_same_path_candidate(
                     Some(msg),
                 ));
             }
-        }
-        if partial_a != partial_b {
-            return SamePathOutcome::ContentDiff(make_path_diff_record(
-                candidate.path.clone(),
-                PathDiffStatus::SamePathDifferentContent,
-                Some(EntryKind::File),
-                None,
-                None,
-                Some(size_a),
-                Some(size_b),
-                candidate.a.mtime,
-                candidate.b.mtime,
-                None,
-                None,
-                Some(ComparisonBasis::PartialHash),
-                partial_a,
-                partial_b,
-                None,
-                None,
-                Vec::new(),
-                None,
-            ));
-        }
+        };
+    if partial_a != partial_b {
+        return SamePathOutcome::ContentDiff(make_path_diff_record(
+            candidate.path.clone(),
+            PathDiffStatus::SamePathDifferentContent,
+            Some(EntryKind::File),
+            None,
+            None,
+            Some(size_a),
+            Some(size_b),
+            candidate.a.mtime,
+            candidate.b.mtime,
+            None,
+            None,
+            Some(ComparisonBasis::PartialHash),
+            partial_a,
+            partial_b,
+            None,
+            None,
+            Vec::new(),
+            None,
+        ));
     }
 
     let hash_a = match cached_full_hash(cache, &candidate.a.abs_path, block_size) {
@@ -841,53 +839,45 @@ pub fn run_diff(cfg: DiffConfig) -> Result<DiffStats> {
             group_a
                 .par_iter()
                 .map(|file| {
-                    let key = if cfg.partial_bytes == 0 {
-                        format!("size-only:{}", file.size)
-                    } else {
-                        match cached_partial_hash(
-                            &hash_cache,
-                            &file.abs_path,
-                            cfg.partial_bytes,
-                            cfg.block_size,
-                        ) {
-                            Ok(value) => value,
-                            Err(err) => {
-                                errors.log(
-                                    "diff",
-                                    format!(
-                                        "partial hash failed for {}: {}",
-                                        file.abs_path.display(),
-                                        err
-                                    ),
-                                );
-                                String::new()
-                            }
+                    let key = match cached_partial_hash(
+                        &hash_cache,
+                        &file.abs_path,
+                        cfg.partial_bytes,
+                        cfg.block_size,
+                    ) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            errors.log(
+                                "diff",
+                                format!(
+                                    "partial hash failed for {}: {}",
+                                    file.abs_path.display(),
+                                    err
+                                ),
+                            );
+                            String::new()
                         }
                     };
                     (file.clone(), key, true)
                 })
                 .chain(group_b.par_iter().map(|file| {
-                    let key = if cfg.partial_bytes == 0 {
-                        format!("size-only:{}", file.size)
-                    } else {
-                        match cached_partial_hash(
-                            &hash_cache,
-                            &file.abs_path,
-                            cfg.partial_bytes,
-                            cfg.block_size,
-                        ) {
-                            Ok(value) => value,
-                            Err(err) => {
-                                errors.log(
-                                    "diff",
-                                    format!(
-                                        "partial hash failed for {}: {}",
-                                        file.abs_path.display(),
-                                        err
-                                    ),
-                                );
-                                String::new()
-                            }
+                    let key = match cached_partial_hash(
+                        &hash_cache,
+                        &file.abs_path,
+                        cfg.partial_bytes,
+                        cfg.block_size,
+                    ) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            errors.log(
+                                "diff",
+                                format!(
+                                    "partial hash failed for {}: {}",
+                                    file.abs_path.display(),
+                                    err
+                                ),
+                            );
+                            String::new()
                         }
                     };
                     (file.clone(), key, false)

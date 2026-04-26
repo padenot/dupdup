@@ -30,7 +30,6 @@ const ERROR_BUFFER_LIMIT: usize = 8;
 pub(crate) struct LiveStats {
     pub(crate) total_files: usize,
     pub(crate) total_candidates: usize,
-    pub(crate) partial_enabled: bool,
     pub(crate) partial_total: u64,
     pub(crate) full_total: Arc<AtomicU64>,
     pub(crate) partial_done: Arc<AtomicU64>,
@@ -624,25 +623,23 @@ pub(crate) fn start_tui(stats: LiveStats) -> Option<JoinHandle<()>> {
                         ])
                         .split(size);
 
-                    let partial_title = if stats.partial_enabled {
-                        "Candidate hash filter"
-                    } else {
-                        "Candidate selection (size)"
-                    };
                     let partial = Gauge::default()
-                        .block(Block::default().title(partial_title).borders(Borders::ALL))
+                        .block(
+                            Block::default()
+                                .title("Candidate hash filter")
+                                .borders(Borders::ALL),
+                        )
                         .gauge_style(Style::default().fg(Color::Cyan))
                         .label(format!("{}/{}", partial_done, partial_total))
                         .ratio(partial_ratio);
                     f.render_widget(partial, chunks[0]);
 
-                    let full_title = if stats.partial_enabled {
-                        "Exact hash verification"
-                    } else {
-                        "Exact hash scan"
-                    };
                     let full = Gauge::default()
-                        .block(Block::default().title(full_title).borders(Borders::ALL))
+                        .block(
+                            Block::default()
+                                .title("Exact hash verification")
+                                .borders(Borders::ALL),
+                        )
                         .gauge_style(Style::default().fg(Color::Green))
                         .label(format!("{}/{}", full_done, full_total))
                         .ratio(full_ratio);

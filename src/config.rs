@@ -10,6 +10,14 @@ pub(crate) fn parse_byte_size(src: &str) -> std::result::Result<usize, String> {
         .map(|b| b.as_u64() as usize)
 }
 
+pub(crate) fn parse_positive_byte_size(src: &str) -> std::result::Result<usize, String> {
+    let value = parse_byte_size(src)?;
+    if value == 0 {
+        return Err("value must be greater than 0".to_string());
+    }
+    Ok(value)
+}
+
 #[derive(clap::ValueEnum, Clone, Default, Debug, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum Preset {
@@ -43,8 +51,8 @@ pub struct ScanConfig {
     #[arg(long, default_value = None)]
     pub error: Option<PathBuf>,
 
-    /// Bytes to read in the candidate-hash stage (set 0 to skip it)
-    #[arg(long, default_value = "4096", value_parser = parse_byte_size)]
+    /// Bytes to read in the candidate-hash stage
+    #[arg(long, default_value = "4096", value_parser = parse_positive_byte_size)]
     pub partial_bytes: usize,
 
     /// Block size used when hashing files
@@ -111,8 +119,8 @@ pub struct DiffConfig {
     #[arg(long, default_value = None)]
     pub error: Option<PathBuf>,
 
-    /// Bytes to read in the candidate-hash stage (set 0 to go directly to full hashes)
-    #[arg(long, default_value = "4096", value_parser = parse_byte_size)]
+    /// Bytes to read in the candidate-hash stage
+    #[arg(long, default_value = "4096", value_parser = parse_positive_byte_size)]
     pub partial_bytes: usize,
 
     /// Block size used when hashing files
