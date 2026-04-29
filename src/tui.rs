@@ -8,7 +8,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
-    widgets::{Block, Borders, Clear, Gauge, Paragraph},
+    widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline},
     Terminal,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -181,6 +181,42 @@ fn recompute_potential_waste(map: &HashMap<String, (u64, Vec<PathBuf>)>) -> u128
         .sum()
 }
 
+fn update_rate_buckets(
+    buckets: &mut VecDeque<u64>,
+    current_bucket: &mut u64,
+    bucket_start: &mut Instant,
+    last_units: &mut u64,
+    now: Instant,
+    units: u64,
+    bucket_duration: Duration,
+) {
+    while now.duration_since(*bucket_start) >= bucket_duration {
+        buckets.push_back(*current_bucket);
+        *current_bucket = 0;
+        *bucket_start += bucket_duration;
+        while buckets.len() > 120 {
+            buckets.pop_front();
+        }
+    }
+
+    *current_bucket += units.saturating_sub(*last_units);
+    *last_units = units;
+}
+
+fn rate_sparkline_data(buckets: &VecDeque<u64>, current_bucket: u64, width: usize) -> Vec<u64> {
+    let width = width.max(1);
+    let mut data: Vec<u64> = buckets.iter().copied().collect();
+    data.push(current_bucket);
+    if data.len() > width {
+        data = data[data.len() - width..].to_vec();
+    } else if data.len() < width {
+        let mut padded = vec![0; width - data.len()];
+        padded.extend(data);
+        data = padded;
+    }
+    data
+}
+
 pub(crate) fn start_tui(stats: LiveStats) -> Option<JoinHandle<()>> {
     let terminal_result: std::io::Result<JoinHandle<()>> = (|| {
         enable_raw_mode()?;
@@ -190,18 +226,15 @@ pub(crate) fn start_tui(stats: LiveStats) -> Option<JoinHandle<()>> {
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
         let handle = thread::spawn(move || {
-            let mut last_bytes = 0u64;
-            let mut last_files = 0u64;
-            let mut last_draw_time = Instant::now();
             let mut phase_start_time = Instant::now();
             let mut phase_start_bytes = 0u64;
             let mut phase_start_files = 0u64;
             let mut phase_start_audio_metadata = 0u64;
             let mut phase_start_audio_fingerprint = 0u64;
-            let mut last_audio_metadata = 0u64;
-            let mut last_audio_fingerprint = 0u64;
-            let mut speed_series: VecDeque<u64> = VecDeque::with_capacity(120);
-            let mut smoothed_rate = 0.0f64;
+            let mut rate_buckets: VecDeque<u64> = VecDeque::with_capacity(120);
+            let mut rate_bucket_start = Instant::now();
+            let mut rate_current_bucket = 0u64;
+            let mut rate_last_units = 0u64;
             let mut last_dup_height = 6usize;
             let mut dup_sort = DupSort::Gain;
             let mut confirm_state: Option<ConfirmState> = None;
@@ -209,11 +242,8 @@ pub(crate) fn start_tui(stats: LiveStats) -> Option<JoinHandle<()>> {
             let mut last_phase = u64::MAX;
             loop {
                 let scan_phase = stats.scan_phase.load(Ordering::Relaxed);
-                if scan_phase != last_phase {
-                    speed_series.clear();
-                    last_bytes = 0;
-                    last_files = 0;
-                    last_draw_time = Instant::now();
+                let phase_changed = scan_phase != last_phase;
+                if phase_changed {
                     phase_start_time = Instant::now();
                     phase_start_bytes = stats.partial_bytes.load(Ordering::Relaxed)
                         + stats.full_bytes.load(Ordering::Relaxed);
@@ -221,9 +251,6 @@ pub(crate) fn start_tui(stats: LiveStats) -> Option<JoinHandle<()>> {
                     phase_start_audio_metadata = stats.audio_metadata_done.load(Ordering::Relaxed);
                     phase_start_audio_fingerprint =
                         stats.audio_fingerprint_done.load(Ordering::Relaxed);
-                    last_audio_metadata = phase_start_audio_metadata;
-                    last_audio_fingerprint = phase_start_audio_fingerprint;
-                    smoothed_rate = 0.0;
                     last_phase = scan_phase;
                 }
                 let partial_done = stats.partial_done.load(Ordering::Relaxed);
@@ -275,68 +302,68 @@ pub(crate) fn start_tui(stats: LiveStats) -> Option<JoinHandle<()>> {
                 let potential_bytes = stats.potential_waste.lock().map(|v| *v).unwrap_or(0);
 
                 let now = Instant::now();
-                let dt = now.duration_since(last_draw_time).as_secs_f64().max(0.001);
-                last_draw_time = now;
-                let (inst_rate, spark_title, info) = if scan_phase == 3 {
-                    let (phase_units, delta_units, title) = if audio_fingerprint_total > 0 {
-                        let delta = audio_fingerprint_done.saturating_sub(last_audio_fingerprint);
-                        last_audio_fingerprint = audio_fingerprint_done;
-                        (
-                            phase_audio_fingerprint,
-                            delta,
-                            "Fingerprint/s (~6s)".to_string(),
-                        )
+                let (rate_units, phase_units, spark_title) = if scan_phase == 3 {
+                    let (phase_units, title) = if audio_fingerprint_total > 0 {
+                        (phase_audio_fingerprint, "Fingerprint/s (~6s)".to_string())
                     } else {
-                        let delta = audio_metadata_done.saturating_sub(last_audio_metadata);
-                        last_audio_metadata = audio_metadata_done;
-                        (phase_audio_metadata, delta, "Probe/s (~6s)".to_string())
+                        (phase_audio_metadata, "Probe/s (~6s)".to_string())
                     };
-                    let inst_scaled = ((delta_units as f64 / dt) * 10.0).round() as u64;
-                    let inst_display = inst_scaled as f64 / 10.0;
+                    let rate_units = if audio_fingerprint_total > 0 {
+                        audio_fingerprint_done
+                    } else {
+                        audio_metadata_done
+                    };
+                    (rate_units, phase_units, title)
+                } else {
+                    (files, phase_files, "Files/s (~6s)".to_string())
+                };
+                let rate_bucket_duration = if scan_phase == 3 {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_secs(1)
+                };
+                if phase_changed {
+                    rate_buckets.clear();
+                    rate_bucket_start = now;
+                    rate_current_bucket = 0;
+                    rate_last_units = rate_units;
+                } else {
+                    update_rate_buckets(
+                        &mut rate_buckets,
+                        &mut rate_current_bucket,
+                        &mut rate_bucket_start,
+                        &mut rate_last_units,
+                        now,
+                        rate_units,
+                        rate_bucket_duration,
+                    );
+                }
+                let info = if scan_phase == 3 {
                     let panel = format!(
-                        "phase-audio {:>6} | total-files {:>6}/{:>6} | dup-cands {:>6} | audio-status {} | inst {:.1} audio/s | potential {}",
+                        "phase-audio {:>6} | total-files {:>6}/{:>6} | dup-cands {:>6} | audio-status {} | current-2s {} | potential {}",
                         phase_units,
                         files,
                         stats.total_files,
                         stats.total_candidates,
                         audio_status_line,
-                        inst_display,
+                        rate_current_bucket,
                         format_bytes_binary_u128(potential_bytes)
                     );
-                    (inst_scaled as f64 / 10.0, title, panel)
+                    panel
                 } else {
-                    let delta_files = files.saturating_sub(last_files);
-                    last_files = files;
-                    let inst_scaled = ((delta_files as f64 / dt) * 10.0).round() as u64;
-                    let inst_display = inst_scaled as f64 / 10.0;
                     let panel = format!(
-                        "phase-files {:>6} | total-files {:>6}/{:>6} | dup-cands {:>6} | phase-bytes {:.2} MiB | phase-avg {:.2} MiB/s | inst {:.1} files/s | potential {}",
-                        phase_files,
+                        "phase-files {:>6} | total-files {:>6}/{:>6} | dup-cands {:>6} | phase-bytes {:.2} MiB | phase-avg {:.2} MiB/s | this-sec {} files/s | potential {}",
+                        phase_units,
                         files,
                         stats.total_files,
                         stats.total_candidates,
                         phase_bytes as f64 / (1024.0 * 1024.0),
                         bps / (1024.0 * 1024.0),
-                        inst_display,
+                        rate_current_bucket,
                         format_bytes_binary_u128(potential_bytes)
                     );
-                    (
-                        inst_scaled as f64 / 10.0,
-                        "Files/s (~6s)".to_string(),
-                        panel,
-                    )
+                    panel
                 };
-                let _delta_bytes = bytes.saturating_sub(last_bytes);
-                last_bytes = bytes;
-                smoothed_rate = if smoothed_rate == 0.0 {
-                    inst_rate
-                } else {
-                    smoothed_rate * 0.65 + inst_rate * 0.35
-                };
-                speed_series.push_back((smoothed_rate * 10.0).round() as u64);
-                if speed_series.len() > 60 {
-                    speed_series.pop_front();
-                }
 
                 let savings_bytes = stats.potential_waste.lock().map(|v| *v).unwrap_or(0);
                 let settings_line = format!(
@@ -660,46 +687,45 @@ pub(crate) fn start_tui(stats: LiveStats) -> Option<JoinHandle<()>> {
                         .block(Block::default().borders(Borders::ALL).title("Speed"));
                     f.render_widget(speed, chunks[3]);
 
-                    let spark_panel = if scan_phase == 3 {
-                        let rate_text = if audio_fingerprint_total > 0 {
+                    let spark_width = chunks[4].width.saturating_sub(2).max(1) as usize;
+                    let spark_data =
+                        rate_sparkline_data(&rate_buckets, rate_current_bucket, spark_width);
+                    let max_speed = spark_data.iter().cloned().max().unwrap_or(1).max(1);
+                    let spark_status = if scan_phase == 3 {
+                        if audio_fingerprint_total > 0 {
                             format!(
-                                "fingerprint {}/{} | phase-audio {} | {}",
+                                "fingerprint {}/{} | current 2s {}",
                                 audio_fingerprint_done,
                                 audio_fingerprint_total,
-                                phase_audio_fingerprint,
-                                spark_title
+                                rate_current_bucket
                             )
                         } else {
                             format!(
-                                "probe {}/{} | phase-audio {} | {}",
-                                audio_metadata_done,
-                                audio_metadata_total,
-                                phase_audio_metadata,
-                                spark_title
+                                "probe {}/{} | current 2s {}",
+                                audio_metadata_done, audio_metadata_total, rate_current_bucket
                             )
-                        };
-                        Paragraph::new(rate_text)
-                            .block(Block::default().borders(Borders::ALL).title("Audio rate"))
+                        }
                     } else {
-                        let raw_spark: Vec<u64> = speed_series.iter().copied().collect();
-                        let spark_width = chunks[4].width.saturating_sub(2).max(1) as usize;
-                        let spark_data: Vec<u64> = if raw_spark.is_empty() {
-                            vec![0; spark_width]
-                        } else if raw_spark.len() >= spark_width {
-                            raw_spark[raw_spark.len() - spark_width..].to_vec()
-                        } else {
-                            let mut padded = vec![0; spark_width - raw_spark.len()];
-                            padded.extend(raw_spark);
-                            padded
-                        };
-                        let max_speed = spark_data.iter().cloned().max().unwrap_or(1).max(1);
-                        let spark_top = max_speed as f64 / 10.0;
-                        Paragraph::new(format!(
-                            "recent throughput | {} top {:.1}",
-                            spark_title, spark_top
-                        ))
-                        .block(Block::default().borders(Borders::ALL).title("Rate"))
+                        format!("{} this-sec {}/s", spark_title, rate_current_bucket)
                     };
+                    let spark_title_label = if scan_phase == 3 {
+                        format!("Audio rate: {}", spark_status)
+                    } else {
+                        format!("Rate: {}", spark_status)
+                    };
+                    let spark_panel = Sparkline::default()
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(spark_title_label),
+                        )
+                        .data(&spark_data)
+                        .max(max_speed)
+                        .style(Style::default().fg(if scan_phase == 3 {
+                            Color::Yellow
+                        } else {
+                            Color::Cyan
+                        }));
                     f.render_widget(spark_panel, chunks[4]);
 
                     let settings_p = Paragraph::new(settings_line.clone())

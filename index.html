@@ -65,16 +65,29 @@
       padding: 8px;
       margin-bottom: 8px;
     }
-    .group-header { display:flex; justify-content:space-between; align-items:center; font-size:12px; color: var(--muted); }
+    .group-header { display:flex; justify-content:space-between; align-items:center; gap: 10px; font-size:12px; color: var(--muted); }
     .paths { margin-top:6px; }
     .path-row { display:flex; align-items:center; gap:8px; font-size: 13px; padding:4px 0; }
     .path-row input { flex-shrink:0; }
-    .path-row span { word-break: break-all; }
+    .path-text {
+      flex: 1 1 auto;
+      min-width: 0;
+      word-break: break-all;
+    }
+    .path-size {
+      flex: 0 0 82px;
+      text-align: right;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
     .keep { color: #7ee787; }
     .delete { color: var(--danger); }
     #charts { display:grid; grid-template-columns: 1fr; gap: 8px; height: 220px; }
     #status { font-size: 12px; color: var(--muted); margin-top:6px; }
     .pill { font-size: 11px; padding: 2px 6px; border-radius: 999px; background: #1f6feb; color:#e6edf3; margin-left:6px; }
+    .pill.audio { background: #8957e5; }
+    .pill.exact { background: #238636; }
     .empty {
       border: 1px dashed #2f3b4a;
       border-radius: 10px;
@@ -147,6 +160,7 @@ function makeGroup(hash, size) {
     pathSizes: new Map(),
     reason: null,
     audioEntries: [],
+    matchType: null,
   };
 }
 
@@ -171,6 +185,8 @@ function ensureGroup(hash, size) {
 function ingestFileRecord(obj) {
   if (!obj || !obj.hash || !obj.path) return false;
   const g = ensureGroup(obj.hash, obj.size ?? null);
+  g.matchType = g.matchType || 'exact';
+  if (obj.size != null) g.pathSizes.set(obj.path, obj.size);
   if (!g.pathSet.has(obj.path)) {
     g.pathSet.add(obj.path);
     g.paths.push(obj.path);
@@ -182,6 +198,11 @@ function ingestFileRecord(obj) {
 function ingestGroupRecord(obj) {
   if (!obj || !obj.hash || !obj.paths) return false;
   const g = ensureGroup(obj.hash, obj.size ?? null);
+  if (obj.type === 'audio-group' || String(obj.hash).startsWith('audio:')) {
+    g.matchType = 'audio';
+  } else {
+    g.matchType = g.matchType || 'exact';
+  }
   g.paths = Array.isArray(obj.paths) ? obj.paths.slice() : [];
   g.pathSet = new Set(g.paths);
   if (g.keepSet && g.keepSet.size) {
@@ -189,10 +210,12 @@ function ingestGroupRecord(obj) {
   } else {
     g.keepSet = new Set();
   }
-  if (obj.size != null) g.size = obj.size;
+  if (obj.size != null) {
+    g.size = obj.size;
+    g.paths.forEach(path => g.pathSizes.set(path, obj.size));
+  }
   if (Array.isArray(obj.entries)) {
     g.audioEntries = obj.entries.slice();
-    g.pathSizes = new Map();
     obj.entries.forEach((entry, idx) => {
       if (entry && entry.path) {
         if (entry.size != null) g.pathSizes.set(entry.path, entry.size);
@@ -202,6 +225,16 @@ function ingestGroupRecord(obj) {
   }
   if (obj.reason) g.reason = obj.reason;
   return true;
+}
+
+function groupTypeLabel(g) {
+  return g.matchType === 'audio' ? 'audio similarity' : 'exact file match';
+}
+
+function pathSize(g, path) {
+  if (g.pathSizes && g.pathSizes.has(path)) return g.pathSizes.get(path);
+  if (g.size != null) return g.size;
+  return null;
 }
 
 function updateDupCount() {
@@ -415,14 +448,15 @@ function renderList() {
     header.className = 'group-header';
     const win = potentialWin(g);
     const winLabel = win ? `${formatBytes(win)} reclaim` : 'select to compute';
-    const sizeLabel = g.size ? `${formatBytes(g.size)} each` : 'variable size';
-    header.innerHTML = `<span>Group ${idx+1} • ${g.paths.length} files • ${sizeLabel}</span><span>${winLabel}</span>`;
+    const sizeLabel = g.size ? `${formatBytes(g.size)} each` : 'variable sizes';
+    const typeClass = g.matchType === 'audio' ? 'audio' : 'exact';
+    header.innerHTML = `<span><span class="pill ${typeClass}">${groupTypeLabel(g)}</span> Group ${idx+1} • ${g.paths.length} files • ${sizeLabel}</span><span>${winLabel}</span>`;
     div.appendChild(header);
-    if (g.reason) {
+    if (g.reason || g.matchType === 'audio') {
       const meta = document.createElement('div');
       meta.className = 'group-header';
       meta.style.marginTop = '6px';
-      meta.innerHTML = `<span>${g.reason}</span><span>${g.hash.startsWith('audio:') ? 'audio match' : ''}</span>`;
+      meta.innerHTML = `<span>${g.reason || 'same audio fingerprint and PCM windows'}</span><span>${g.matchType === 'audio' ? 'not byte-identical necessarily' : ''}</span>`;
       div.appendChild(meta);
     }
     const paths = document.createElement('div');
@@ -439,6 +473,7 @@ function renderList() {
         renderList();
       };
       const label = document.createElement('span');
+      label.className = 'path-text';
       const entry = Array.isArray(g.audioEntries) ? g.audioEntries.find(item => item.path === p) : null;
       const parts = [p];
       if (entry) {
@@ -448,12 +483,15 @@ function renderList() {
         if (entry.bit_depth) tech.push(`${entry.bit_depth}-bit`);
         if (entry.sample_rate) tech.push(`${(entry.sample_rate / 1000).toFixed(1)} kHz`);
         if (entry.bitrate_kbps) tech.push(`${entry.bitrate_kbps} kbps`);
-        if (entry.size != null) tech.push(formatBytes(entry.size));
         if (tech.length) parts.push(`(${tech.join(', ')})`);
       }
       label.textContent = parts.join(' ');
       const kept = g.keepSet?.has(i);
-      label.className = kept ? 'keep' : 'delete';
+      label.classList.add(kept ? 'keep' : 'delete');
+      const size = document.createElement('span');
+      size.className = 'path-size';
+      const bytes = pathSize(g, p);
+      size.textContent = bytes == null ? '-' : formatBytes(bytes);
       const pill = document.createElement('span');
       pill.className = 'pill';
       pill.textContent = kept ? 'KEEP' : 'DELETE';
@@ -501,8 +539,11 @@ function renderList() {
       actions.appendChild(revealBtn);
       actions.appendChild(delBtn);
 
-      row.appendChild(cb); row.appendChild(label); row.appendChild(pill); row.appendChild(actions);
+      row.appendChild(cb);
+      row.appendChild(label);
+      row.appendChild(size);
       row.appendChild(pill);
+      row.appendChild(actions);
       paths.appendChild(row);
     });
     div.appendChild(paths);
