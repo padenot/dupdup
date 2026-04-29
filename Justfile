@@ -13,6 +13,10 @@ cross-linux: setup-cross setup-cross-chromaprint
     ZIG_LOCAL_CACHE_DIR={{justfile_directory()}}/.tools/zig-cache/local \
     cargo build --release --target x86_64-unknown-linux-musl
 
+# Build Linux x86_64 release and package binary + docs + schema into dist/*.tar.xz
+dist-linux: cross-linux
+    {{justfile_directory()}}/scripts/package-linux-x86_64-dist.sh
+
 # Add Linux musl target to local rustup (repo-local)
 setup-cross:
     @set -euo pipefail; \
